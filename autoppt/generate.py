@@ -35,11 +35,64 @@ def shape_info(slide, shape_id):
     return next(s for s in slide["shapes"] if s["id"] == str(shape_id))
 
 
+def photo_frame_shape(slide, photo):
+    """查找照片后方的可见框，优先匹配横向位置、宽度和底边一致的空白形状。"""
+    px, py, pw, ph = photo["bbox"]
+    if pw <= 0 or ph <= 0:
+        return None
+    candidates = []
+    for shape in slide["shapes"]:
+        if shape["id"] == photo["id"] or shape["kind"] != "sp" or shape["text"]:
+            continue
+        x, y, width, height = shape["bbox"]
+        if width <= 0 or height <= 0 or not .65 <= height / ph <= 1.35:
+            continue
+        dx = abs(x - px) / pw
+        dw = abs(width - pw) / pw
+        db = abs((y + height) - (py + ph)) / ph
+        if dx <= .08 and dw <= .08 and db <= .08:
+            candidates.append((dx + dw + db, shape))
+    return min(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def align_shape_bbox(node, current_bbox, target_bbox):
+    """按页面坐标调整对象边界，兼容位于普通组合中的图片对象。"""
+    transform = node.find("a:xfrm", NS)
+    if transform is None:
+        transform = node.find("p:spPr/a:xfrm", NS)
+    if transform is None:
+        return
+    offset, extent = transform.find("a:off", NS), transform.find("a:ext", NS)
+    if offset is None or extent is None:
+        return
+    current_x, current_y, current_width, current_height = current_bbox
+    target_x, target_y, target_width, target_height = target_bbox
+    local_width, local_height = int(extent.get("cx", 0)), int(extent.get("cy", 0))
+    if current_width <= 0 or current_height <= 0 or local_width <= 0 or local_height <= 0:
+        return
+    scale_x, scale_y = current_width / local_width, current_height / local_height
+    offset.set("x", str(round(int(offset.get("x", 0)) + (target_x - current_x) / scale_x)))
+    offset.set("y", str(round(int(offset.get("y", 0)) + (target_y - current_y) / scale_y)))
+    extent.set("cx", str(round(target_width / scale_x)))
+    extent.set("cy", str(round(target_height / scale_y)))
+
+
 def clear_links(node):
     # 原文本上的旧网址、动作和字段不能跟随新专家一起复制。
     for item in list(node.iter()):
         if ET.QName(item).localname in ("hlinkClick", "hlinkMouseOver"):
             item.getparent().remove(item)
+
+
+def bring_to_front(node):
+    """将对象移到当前组合的顶层，同时保持扩展节点位于结构末尾。"""
+    parent = node.getparent()
+    parent.remove(node)
+    extension = parent.find("p:extLst", NS)
+    if extension is None:
+        parent.append(node)
+    else:
+        parent.insert(parent.index(extension), node)
 
 
 def set_text(node, lines, *, font=None, preserve_sizes=True, line_spacing=None):
@@ -280,25 +333,22 @@ def page_plan(model):
     return plan
 
 
-def portrait_bytes(expert, ratio, top_padding=0, bottom_padding=0):
+def portrait_bytes(expert, ratio):
     package = read_package(expert["path"])
     data = package[expert["photo"]]
     with Image.open(io.BytesIO(data)) as photo:
-        photo = ImageOps.exif_transpose(photo).convert("RGBA")
+        photo = ImageOps.exif_transpose(photo).convert("RGB")
         target_h = min(1800, max(600, photo.height))
         target_w = max(1, round(target_h * ratio))
-        # 使用完整照片等比放入模板框，透明补边，不进行收费抠图或猜测裁切。
-        usable_height = max(1, round(target_h * (1 - top_padding - bottom_padding)))
-        fitted = ImageOps.contain(photo, (target_w, usable_height))
-        canvas = Image.new("RGBA", (target_w, target_h), (255, 255, 255, 0))
-        canvas.alpha_composite(fitted, ((target_w - fitted.width) // 2,
-                                       target_h - round(target_h * bottom_padding) - fitted.height))
+        # 等比放大并裁切到图片框尺寸，人物略微上移，避免顶部留白并尽量保留头部。
+        fitted = ImageOps.fit(photo, (target_w, target_h), method=Image.Resampling.LANCZOS,
+                              centering=(0.5, 0.4))
         output = io.BytesIO()
-        canvas.save(output, "PNG", optimize=False)
+        fitted.save(output, "PNG", optimize=False)
         return output.getvalue()
 
 
-def replace_photo(node, rels, package, expert, shape, cache, protected=()):
+def replace_photo(node, rels, package, expert, shape, cache):
     blip = node.find(".//a:blip", NS)
     if blip is None:
         raise ValueError("照片区域没有可替换图片")
@@ -307,23 +357,10 @@ def replace_photo(node, rels, package, expert, shape, cache, protected=()):
         metadata.set('descr', expert['name'] + '资料照片')
         metadata.attrib.pop('title', None)
     ratio = shape["bbox"][2] / max(1, shape["bbox"][3])
-    x, y, width, height = shape['bbox']
-    top_padding, bottom_padding = 0, 0
-    # 原抠图的透明边缘可能覆盖角色标签，替换为有背景照片时保留安全透明边缘。
-    for box in protected:
-        bx, by, bw, bh = box
-        if min(x + width, bx + bw) <= max(x, bx):
-            continue
-        if by <= y + height * .4 and by + bh > y:
-            top_padding = max(top_padding, (by + bh + 50800 - y) / max(height, 1))
-        elif by >= y + height * .6 and by < y + height:
-            bottom_padding = max(bottom_padding, (y + height - by + 50800) / max(height, 1))
-    if top_padding + bottom_padding > .5:
-        raise ValueError(f"{expert['name']}的照片区域与文字区域重叠过多，请调整照片映射")
-    key = (expert["path"], expert["photo"], round(ratio, 4), round(top_padding, 4), round(bottom_padding, 4))
+    key = (expert["path"], expert["photo"], round(ratio, 4))
     if key not in cache:
         target = f"ppt/media/autoppt_{len(cache) + 1}.png"
-        package[target] = portrait_bytes(expert, ratio, top_padding, bottom_padding)
+        package[target] = portrait_bytes(expert, ratio)
         cache[key] = target
     rid = "rIdAutoPortrait"
     occupied = {r.get("Id") for r in rels}
@@ -468,8 +505,17 @@ def generate(model, destination):
                     fit_lines(role_node, shape_info(source, fields["role"]), [label], minimum=10)
                 photo_node = find_shape(root, fields["photo"])
                 if person.get("photo"):
-                    protected = [shape_info(source, fields[k])['bbox'] for k in ('role', 'identity', 'hospital') if fields.get(k)]
-                    replace_photo(photo_node, rels, package, person, shape_info(source, fields["photo"]), cache, protected)
+                    photo_shape = shape_info(source, fields["photo"])
+                    frame_shape = photo_frame_shape(source, photo_shape)
+                    replacement_shape = photo_shape
+                    if frame_shape:
+                        # 各类人物页的原照片对象高度不同，统一对齐到后方可见圆角框。
+                        align_shape_bbox(photo_node, photo_shape["bbox"], frame_shape["bbox"])
+                        replacement_shape = {**photo_shape, "bbox": frame_shape["bbox"]}
+                    replace_photo(photo_node, rels, package, person, replacement_shape, cache)
+                    if fields.get("role"):
+                        # 图片充满框后，将角色标签置于照片上层，避免标签被照片遮挡。
+                        bring_to_front(find_shape(root, fields["role"]))
                 else:
                     photo_node.getparent().remove(photo_node)
                     messages.append(issue("photo_missing", f"{person['name']}未填入照片，旧照片已清除"))

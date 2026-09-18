@@ -17,7 +17,7 @@ from PIL import Image
 
 from autoppt.analyze import analyze, analyze_template, discover, names_in, parse_agenda, read_expert
 from autoppt.bio import summarize_bio
-from autoppt.generate import generate, page_plan, validate_model
+from autoppt.generate import generate, page_plan, photo_frame_shape, validate_model
 from autoppt.ooxml import NS, compact, encoded, read_deck, read_package, unpack_experts, xml
 from autoppt.server import Handler, TOKEN, ThreadingHTTPServer, apply_edits
 
@@ -187,22 +187,35 @@ class PipelineTests(unittest.TestCase):
         for slide, spec in zip(self.deck['slides'], self.report['pages']):
             original = {s['id']: s for s in templates[spec['template_slide']]['shapes']}
             for shape in slide['shapes']:
-                self.assertEqual(shape['bbox'], original[shape['id']]['bbox'])
+                expected = original[shape['id']]['bbox']
+                if spec.get('expert') and shape['id'] == templates[spec['template_slide']]['fields']['photo']:
+                    # 照片对象按可见圆角框校正，其余模板对象保持原坐标。
+                    frame = photo_frame_shape(templates[spec['template_slide']], original[shape['id']])
+                    if frame:
+                        expected = frame['bbox']
+                self.assertEqual(shape['bbox'], expected)
 
-    def test_replacement_photo_does_not_cover_role_label(self):
+    def test_replacement_photo_fills_frame(self):
         package = read_package(self.output)
         for slide, spec in zip(self.deck['slides'], self.report['pages']):
-            if spec['role'] != 'host':
+            if not spec.get('expert'):
                 continue
             source = self.models['input1']['template']['slides'][spec['template_slide'] - 1]
             picture = next(s for s in slide['shapes'] if s['id'] == source['fields']['photo'])
-            role = next(s for s in slide['shapes'] if s['id'] == source['fields']['role'])
-            x, y, w, h = picture['bbox']
-            rx, ry, rw, rh = role['bbox']
-            if ry + rh > y and ry < y + h:
-                with Image.open(io.BytesIO(package[picture['image']])) as image:
-                    pixel_bottom = int((ry + rh - y) / h * image.height)
-                    self.assertEqual(image.getchannel('A').crop((0, 0, image.width, pixel_bottom)).getextrema(), (0, 0))
+            source_picture = next(s for s in source['shapes'] if s['id'] == source['fields']['photo'])
+            frame = photo_frame_shape(source, source_picture)
+            expected_bbox = frame['bbox'] if frame else source_picture['bbox']
+            self.assertEqual(picture['bbox'], expected_bbox)
+            _, _, width, height = expected_bbox
+            with Image.open(io.BytesIO(package[picture['image']])) as image:
+                # 替换后的照片尺寸直接匹配图片框比例，输出不再包含透明补边。
+                self.assertAlmostEqual(image.width / image.height, width / height, places=2)
+                self.assertEqual(image.mode, 'RGB')
+            if source['fields'].get('role'):
+                # 角色标签必须位于照片之后，确保PPT渲染时标签显示在照片上层。
+                shape_ids = [shape['id'] for shape in slide['shapes']]
+                self.assertLess(shape_ids.index(source['fields']['photo']),
+                                shape_ids.index(source['fields']['role']))
 
     def test_template_names_and_ids_are_not_required(self):
         model = self.models['input1']
