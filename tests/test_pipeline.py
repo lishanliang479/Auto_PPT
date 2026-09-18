@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -299,6 +300,15 @@ class HTTPTests(unittest.TestCase):
         self.assertIn('AutoPPT', urllib.request.urlopen(self.url).read().decode())
         data = json.load(urllib.request.urlopen(self.url + '/api/config'))
         self.assertEqual(data['token'], TOKEN)
+
+    def test_static_types_ignore_system_file_associations(self):
+        # 模拟系统将扩展名关联为普通文本，脚本与样式仍须返回浏览器认可的类型。
+        with patch('mimetypes.guess_type', return_value=('text/plain', None)):
+            for path, mime in (('/', 'text/html'), ('/app.js', 'text/javascript'), ('/style.css', 'text/css')):
+                with self.subTest(path=path), urllib.request.urlopen(self.url + path) as response:
+                    self.assertEqual(response.headers['Content-Type'], mime + '; charset=utf-8')
+                    self.assertEqual(response.headers['X-Content-Type-Options'], 'nosniff')
+                    self.assertTrue(response.read())
 
     def test_cross_site_post_blocked(self):
         request = urllib.request.Request(self.url + '/api/sample', data=b'{"name":"input1"}', method='POST')

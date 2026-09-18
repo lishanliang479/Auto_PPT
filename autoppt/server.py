@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import json
-import mimetypes
 import secrets
 import threading
 import traceback
@@ -176,10 +175,15 @@ class Handler(BaseHTTPRequestHandler):
             if parts[3] == "report" and job.get("report"):
                 return self.response(job["report"], filename="核对报告.json")
             return self.response({"error": "文件尚未生成"}, 404)
-        static = {"/": "index.html", "/app.js": "app.js", "/style.css": "style.css"}
+        # 明确静态资源类型，避免Windows的扩展名关联将脚本识别为普通文本。
+        # 浏览器启用nosniff后会拒绝执行类型错误的脚本，导致上传按钮没有响应。
+        static = {"/": ("index.html", "text/html"),
+                  "/app.js": ("app.js", "text/javascript"),
+                  "/style.css": ("style.css", "text/css")}
         if path in static:
-            file = ROOT / "web" / static[path]
-            return self.response(file.read_bytes(), mime=(mimetypes.guess_type(file.name)[0] or "text/plain") + "; charset=utf-8")
+            filename, mime = static[path]
+            file = ROOT / "web" / filename
+            return self.response(file.read_bytes(), mime=mime + "; charset=utf-8")
         return self.response({"error": "未找到页面"}, 404)
 
     def do_POST(self):
