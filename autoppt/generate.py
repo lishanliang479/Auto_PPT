@@ -24,6 +24,14 @@ from .ooxml import NS, compact, encoded, paragraphs, read_deck, read_package, re
 ROLE_LABELS = {"chair": "大会主席", "host": "大会主持", "speaker": "大会讲者", "guest": "讨论嘉宾"}
 
 
+def display_name(name):
+    """两个汉字的姓名在展示时加入一个空格，内部匹配仍使用原姓名。"""
+    value = str(name or "").strip()
+    if len(value) == 2 and all("\u4e00" <= char <= "\u9fff" for char in value):
+        return value[0] + " " + value[1]
+    return value
+
+
 def find_shape(root, shape_id):
     for prop in root.findall(".//p:cNvPr", NS):
         if prop.get("id") == str(shape_id):
@@ -104,7 +112,9 @@ def set_text(node, lines, *, font=None, preserve_sizes=True, line_spacing=None):
     if body is None:
         raise ValueError("选择的文本区域不支持直接编辑，请选择普通文本框")
     source = body.findall("a:p", NS)
-    templates = [copy.deepcopy(p) for p in source if p.xpath('.//a:t/text()', namespaces=NS)] or [ET.Element(tag("a", "p"))]
+    templates = ([copy.deepcopy(p) for p in source if p.xpath('.//a:t/text()', namespaces=NS)]
+                 or [copy.deepcopy(p) for p in source]
+                 or [ET.Element(tag("a", "p"))])
     for para in source:
         body.remove(para)
     for index, value in enumerate(lines or [""]):
@@ -129,7 +139,10 @@ def set_text(node, lines, *, font=None, preserve_sizes=True, line_spacing=None):
         runs = [r for r in original.findall('a:r', NS) if ''.join(r.xpath('./a:t/text()', namespaces=NS)).strip()]
         # 空白占位符常带有异常字号，只继承实际文字的格式。
         props = [r.find('a:rPr', NS) for r in runs if r.find('a:rPr', NS) is not None]
-        selected = props[0] if props else None
+        selected = props[0] if props else original.find('a:endParaRPr', NS)
+        if selected is None:
+            defaults = body.xpath('./a:lstStyle//a:defRPr', namespaces=NS)
+            selected = defaults[0] if defaults else None
         rpr = copy.deepcopy(selected) if selected is not None else ET.Element(tag("a", "rPr"))
         clear_links(rpr)
         if font is not None:
@@ -201,40 +214,28 @@ def fit_lines(node, shape, lines, minimum=14):
     width, height, original_size, family = text_box(node, shape)
     if compact(''.join(paragraphs(node))) == compact(''.join(lines)):
         return False, original_size
-    size = original_size
-    minimum = min(minimum, size)
-    while size > minimum and (estimated_height(lines, width, size, family, node) > height
-                              or any(text_width(line, measure_font(size, family)) > width * 4 for line in lines)):
-        size = max(minimum, size - 1)
-    overflow = estimated_height(lines, width, size, family, node) > height
-    set_text(node, lines, font=size)
-    return overflow, size
+    # 新文字完整继承模板段落的字号、字体、颜色和行距，不再自动覆盖字号。
+    overflow = estimated_height(lines, width, original_size, family, node) > height
+    set_text(node, lines)
+    return overflow, original_size
 
 
-def select_single_page_bio(node, shape, person, font_size=16):
-    """优先使用指定字号放置简介，极小区域自动缩放并保留可生成结果。"""
-    width, height, _, family = text_box(node, shape)
+def select_single_page_bio(node, shape, person):
+    """使用模板原有字号和行距放置简介，容量不足时精简低优先级内容。"""
+    width, height, size, family = text_box(node, shape)
     summary = summarize_bio(person)
     lines = summary['lines'][:]
-    size = int(font_size)
-    line_spacing = 1.8
     # 长研究方向需要自动换行时，先减少低优先级社会任职，保留个人专业介绍。
-    while len(lines) > 1 and estimated_height(lines, width, size, family, node, line_spacing) > height:
+    while len(lines) > 1 and estimated_height(lines, width, size, family, node) > height:
         social_indexes = [index for index, value in enumerate(lines) if value in summary['social']]
         other_selected = any(value in summary['other'] for value in lines)
         if other_selected and social_indexes:
             lines.pop(social_indexes[-1])
         else:
             lines.pop()
-    adjusted = False
-    # 模板简介框过小时逐级降低字号和行距，保证自动生成不中断。
-    while size > 10 and estimated_height(lines, width, size, family, node, line_spacing) > height:
-        size -= 1
-        adjusted = True
-    while line_spacing > 1.0 and estimated_height(lines, width, size, family, node, line_spacing) > height:
-        line_spacing = round(max(1.0, line_spacing - .1), 1)
-        adjusted = True
-    while lines and estimated_height(lines, width, size, family, node, line_spacing) > height:
+    adjusted = lines != summary['lines']
+    # 单行仍超出模板容量时仅精简文字，保持模板格式不变。
+    while lines and estimated_height(lines, width, size, family, node) > height:
         if len(lines) > 1:
             lines.pop()
         elif len(lines[0]) > 12:
@@ -243,7 +244,7 @@ def select_single_page_bio(node, shape, person, font_size=16):
             lines = []
         adjusted = True
     selected_social = [x for x in lines if x in summary['social']]
-    summary.update(lines=lines, font=size, line_spacing=line_spacing, fit_adjusted=adjusted,
+    summary.update(lines=lines, font=size, line_spacing="template", fit_adjusted=adjusted,
                    selected_social=selected_social,
                    omitted_social=[x for x in summary['social'] if x not in selected_social])
     return summary
@@ -379,8 +380,18 @@ def portrait_bytes(expert, ratio):
     else:
         package = read_package(expert["path"])
         data = package[expert["photo"]]
+    selected = next((photo for photo in expert.get("photos", [])
+                     if photo.get("image") == expert.get("photo")), {})
     with Image.open(io.BytesIO(data)) as photo:
         photo = ImageOps.exif_transpose(photo).convert("RGB")
+        # 专家资料PPT可能依靠图片对象旋转或翻转显示正确方向，替换前需还原视觉效果。
+        if selected.get("flip_h"):
+            photo = ImageOps.mirror(photo)
+        if selected.get("flip_v"):
+            photo = ImageOps.flip(photo)
+        rotation = float(selected.get("rotation", 0) or 0)
+        if rotation:
+            photo = photo.rotate(-rotation, expand=True)
         target_h = min(1800, max(600, photo.height))
         target_w = max(1, round(target_h * ratio))
         source_ratio = photo.width / max(photo.height, 1)
@@ -403,7 +414,10 @@ def replace_photo(node, rels, package, expert, shape, cache):
         metadata.set('descr', expert['name'] + '资料照片')
         metadata.attrib.pop('title', None)
     ratio = shape["bbox"][2] / max(1, shape["bbox"][3])
-    key = (expert["path"], expert["photo"], round(ratio, 4))
+    selected = next((photo for photo in expert.get("photos", [])
+                     if photo.get("image") == expert.get("photo")), {})
+    key = (expert["path"], expert["photo"], round(ratio, 4), selected.get("rotation", 0),
+           selected.get("flip_h", False), selected.get("flip_v", False))
     if key not in cache:
         target = f"ppt/media/autoppt_{len(cache) + 1}.png"
         package[target] = portrait_bytes(expert, ratio)
@@ -513,9 +527,7 @@ def generate(model, destination):
         summary = None
         if person and fields.get("bio"):
             node = find_shape(original, fields["bio"])
-            summary = select_single_page_bio(
-                node, shape_info(source, fields['bio']), person,
-                font_size=model["options"].get("bio_font_size", 16))
+            summary = select_single_page_bio(node, shape_info(source, fields['bio']), person)
             bio_pages = [summary['lines']]
             summaries.setdefault(person['name'], []).append(summary)
             if summary.get("fit_adjusted"):
@@ -569,7 +581,7 @@ def generate(model, destination):
                             title_written = True
                     set_text(node, new_lines)
             elif person:
-                title = person["name"] + ("  " + person["display_title"] if person["display_title"] else "")
+                title = display_name(person["name"]) + ("  " + person["display_title"] if person["display_title"] else "")
                 identity_lines = [title]
                 if fields.get("hospital"):
                     fit_lines(find_shape(root, fields["hospital"]), shape_info(source, fields["hospital"]), [person["display_hospital"]], minimum=14)
@@ -579,7 +591,7 @@ def generate(model, destination):
                     set_text(find_shape(root, fields["identity"]), identity_lines)
                 if fields.get("bio") and summary:
                     body = find_shape(root, fields["bio"])
-                    set_text(body, body_lines, font=summary['font'], line_spacing=summary['line_spacing'])
+                    set_text(body, body_lines)
                 if fields.get("role"):
                     role_node = find_shape(root, fields["role"])
                     label = ROLE_LABELS[role]
@@ -604,7 +616,7 @@ def generate(model, destination):
                 lines = []
                 for name in item["people"]:
                     p = expert_data(name)
-                    lines.append("  ".join(v for v in (name, p["display_title"], p["display_hospital"]) if v))
+                    lines.append("  ".join(v for v in (display_name(name), p["display_title"], p["display_hospital"]) if v))
                 for field, values, minimum in [("people", lines, 18), ("title", [item["title"]], 24)]:
                     sid = fields.get(field)
                     if not sid:

@@ -17,7 +17,7 @@ from PIL import Image
 
 from autoppt.analyze import analyze, analyze_template, discover, filename_name, names_in, parse_agenda, read_expert
 from autoppt.bio import summarize_bio
-from autoppt.generate import generate, page_plan, photo_frame_shape, portrait_bytes, validate_model
+from autoppt.generate import display_name, find_shape, generate, page_plan, photo_frame_shape, portrait_bytes, validate_model
 from autoppt.ooxml import NS, compact, encoded, read_deck, read_package, unpack_experts, xml
 from autoppt.poster import clean_name, organizer_from_logo, render_poster, unpack_portraits
 from autoppt.server import Handler, TOKEN, ThreadingHTTPServer, apply_edits, apply_poster_edits, ppt_output_filename
@@ -26,6 +26,31 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 class RuleTests(unittest.TestCase):
+    def test_two_character_name_has_one_space(self):
+        # 两字姓名只调整展示形式，三字及以上姓名保持原样。
+        self.assertEqual(display_name('田静'), '田 静')
+        self.assertEqual(display_name('张培根'), '张培根')
+
+    def test_ppt_picture_rotation_is_applied_to_portrait(self):
+        # 专家PPT用对象旋转纠正横向原图时，生成头像应保持相同视觉方向。
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / 'rotated.pptx'
+            original = Image.new('RGB', (400, 200), 'red')
+            for x in range(200, 400):
+                for y in range(200):
+                    original.putpixel((x, y), (0, 0, 255))
+            payload = io.BytesIO()
+            original.save(payload, 'PNG')
+            with zipfile.ZipFile(source, 'w') as archive:
+                archive.writestr('ppt/media/image1.png', payload.getvalue())
+            expert = {'path': str(source), 'photo': 'ppt/media/image1.png',
+                      'photos': [{'image': 'ppt/media/image1.png', 'rotation': 90}]}
+            with Image.open(io.BytesIO(portrait_bytes(expert, .5))) as result:
+                top = result.getpixel((result.width // 2, result.height // 6))
+                bottom = result.getpixel((result.width // 2, result.height * 5 // 6))
+                self.assertGreater(top[0], top[2])
+                self.assertGreater(bottom[2], bottom[0])
+
     def test_missing_person_after_hospital(self):
         self.assertEqual(names_in('李 磊 教授 单县中心医院 朱 帅 教授 山东大学齐鲁医院', ['李磊']), ['李磊', '朱帅'])
         self.assertEqual(names_in('杨秀婷教授山东大学齐鲁医院崔景利教授山东省肿瘤医院'), ['杨秀婷', '崔景利'])
@@ -234,7 +259,7 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(options['repeat_chairs'])
         self.assertFalse(options['include_topics'])
         self.assertTrue(options['draft'])
-        self.assertEqual(options['bio_font_size'], 16)
+        self.assertNotIn('bio_font_size', options)
 
     def test_table_agenda_and_missing_expert(self):
         model = self.models['input']
@@ -282,6 +307,8 @@ class PipelineTests(unittest.TestCase):
 
     def test_selected_bio_is_complete_and_single_page(self):
         model = self.models['input1']
+        source_package = read_package(model['template']['path'])
+        output_package = read_package(self.output)
         self.assertEqual(len(self.deck['slides']), len(page_plan(model)))
         for slide, spec in zip(self.deck['slides'], self.report['pages']):
             if not spec.get('expert'):
@@ -294,8 +321,23 @@ class PipelineTests(unittest.TestCase):
             source = model['template']['slides'][spec['template_slide'] - 1]
             body = next(s for s in slide['shapes'] if s['id'] == source['fields']['bio'])
             self.assertEqual(body['lines'][0], spec['selected_bio'][0])
-            # 专家简介正文固定使用16磅字号。
-            self.assertEqual(body['font'], 16)
+            # 专家简介正文沿用当前模板简介区域的字号。
+            self.assertEqual(body['font'], source['shapes'][next(
+                index for index, item in enumerate(source['shapes']) if item['id'] == source['fields']['bio'])]['font'])
+            # 每段字号和行距均直接继承对应的模板段落。
+            source_node = find_shape(xml(source_package[source['part']]), source['fields']['bio'])
+            output_node = find_shape(xml(output_package[slide['part']]), source['fields']['bio'])
+            source_paragraphs = [p for p in source_node.findall('.//a:p', NS)
+                                 if p.xpath('.//a:t/text()', namespaces=NS)]
+            output_paragraphs = output_node.findall('.//a:p', NS)
+            for index, paragraph in enumerate(output_paragraphs):
+                template_paragraph = source_paragraphs[min(index, len(source_paragraphs) - 1)]
+                self.assertEqual(
+                    paragraph.xpath('./a:pPr/a:lnSpc/*/@val', namespaces=NS),
+                    template_paragraph.xpath('./a:pPr/a:lnSpc/*/@val', namespaces=NS))
+                self.assertEqual(
+                    paragraph.xpath('./a:r/a:rPr/@sz', namespaces=NS)[:1],
+                    template_paragraph.xpath('./a:r/a:rPr/@sz', namespaces=NS)[:1])
 
     def test_summary_keeps_source_in_report(self):
         used = {page.get('expert') for page in self.report['pages'] if page.get('expert')}

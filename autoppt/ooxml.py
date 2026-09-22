@@ -107,10 +107,17 @@ def geometry(node, parent_transform=(0, 0, 1, 1)):
             int(ext.get("cx", 0)) * sx, int(ext.get("cy", 0)) * sy]
 
 
-def image_thumbnail(data, size=(260, 210)):
+def image_thumbnail(data, size=(260, 210), rotation=0, flip_h=False, flip_v=False):
     try:
         with Image.open(io.BytesIO(data)) as im:
             im = ImageOps.exif_transpose(im)
+            # Office可通过图片对象变换修正原图方向，缩略图需同步应用这些变换。
+            if flip_h:
+                im = ImageOps.mirror(im)
+            if flip_v:
+                im = ImageOps.flip(im)
+            if rotation:
+                im = im.rotate(-rotation, expand=True)
             im.thumbnail(size)
             if im.mode not in ("RGB", "RGBA"):
                 im = im.convert("RGB")
@@ -154,6 +161,13 @@ def slide_shapes(root, package, part):
             shape = {"id": prop.get("id"), "name": prop.get("name", ""), "kind": kind,
                      "lines": lines, "text": "\n".join(lines), "bbox": bbox,
                      "font": max(fonts, default=18), "table": []}
+            xfrm = node.find("p:spPr/a:xfrm", NS)
+            if xfrm is None:
+                xfrm = node.find("a:xfrm", NS)
+            rotation = (int(xfrm.get("rot", "0")) / 60000) % 360 if xfrm is not None else 0
+            flip_h = xfrm is not None and xfrm.get("flipH") in ("1", "true")
+            flip_v = xfrm is not None and xfrm.get("flipV") in ("1", "true")
+            shape.update(rotation=rotation, flip_h=flip_h, flip_v=flip_v)
             for row in node.findall(".//a:tr", NS):
                 shape["table"].append([" ".join(paragraphs(cell)) for cell in row.findall("a:tc", NS)])
             blip = node.find(".//a:blip", NS)
@@ -162,7 +176,9 @@ def slide_shapes(root, package, part):
                 rid = blip.get(tag("r", "embed"))
                 rel = rels.get(rid, {})
                 target = resolve(part, rel.get("Target", ""))
-                shape.update(image=target, rid=rid, thumbnail=image_thumbnail(package.get(target, b"")))
+                shape.update(image=target, rid=rid,
+                             thumbnail=image_thumbnail(package.get(target, b""), rotation=rotation,
+                                                       flip_h=flip_h, flip_v=flip_v))
             shapes.append(shape)
 
     tree = root.find("p:cSld/p:spTree", NS)

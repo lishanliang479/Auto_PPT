@@ -170,7 +170,10 @@ def read_expert(path):
                     if area > .65 or h < deck["height"] * .15:
                         score -= 4
                     candidates.append({"id": f'{slide["number"]}:{shape["id"]}', "image": shape["image"],
-                                       "thumbnail": shape["thumbnail"], "score": score})
+                                       "thumbnail": shape["thumbnail"], "score": score,
+                                       "rotation": shape.get("rotation", 0),
+                                       "flip_h": shape.get("flip_h", False),
+                                       "flip_v": shape.get("flip_v", False)})
     candidates.sort(key=lambda i: i["score"], reverse=True)
     if not name:
         found = names_in("\n".join(lines))
@@ -528,5 +531,5 @@ def analyze(template, agenda, sources, workdir, cache_dir=None):
     issues.extend(profile.pop("issues"))
     # 网页默认保留主席简介并允许待核对版本，讨论话题页默认关闭。
     return {"version": 1, "experts": experts, "agenda": schedule, "template": profile, "issues": issues,
-            "options": {"draft": True, "repeat_chairs": True, "include_topics": False, "bio_font_size": 16},
+            "options": {"draft": True, "repeat_chairs": True, "include_topics": False},
             "metrics": {"analysis_seconds": round(time.perf_counter() - started, 3), "ai_calls": 0}}
