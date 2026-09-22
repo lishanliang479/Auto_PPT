@@ -12,6 +12,11 @@ from pathlib import Path
 from lxml import etree as ET
 from PIL import Image, ImageOps
 
+try:
+    import olefile
+except ImportError:  # pragma: no cover，安装依赖后正常加载
+    olefile = None
+
 NS = {
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
     "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
@@ -152,7 +157,8 @@ def slide_shapes(root, package, part):
             for row in node.findall(".//a:tr", NS):
                 shape["table"].append([" ".join(paragraphs(cell)) for cell in row.findall("a:tc", NS)])
             blip = node.find(".//a:blip", NS)
-            if kind == "pic" and blip is not None:
+            # 部分专家PPT把头像设置为普通形状的图片填充，需要和独立图片对象一起读取。
+            if blip is not None:
                 rid = blip.get(tag("r", "embed"))
                 rel = rels.get(rid, {})
                 target = resolve(part, rel.get("Target", ""))
@@ -200,13 +206,68 @@ def read_docx(path):
                          else paragraphs(ET.fromstring(b"<root>" + ET.tostring(node) + b"</root>"), "w"))
     rels = relationships(package, "word/document.xml")
     images = []
+    seen_images = set()
     for blip in root.findall(".//a:blip", NS):
         rel = rels.get(blip.get(tag("r", "embed")), {})
         target = resolve("word/document.xml", rel.get("Target", ""))
-        if target in package:
+        if target in package and target not in seen_images:
+            seen_images.add(target)
             thumb = image_thumbnail(package[target])
             if thumb:
-                images.append({"image": target, "thumbnail": thumb})
+                width = height = 0
+                try:
+                    with Image.open(io.BytesIO(package[target])) as image:
+                        width, height = image.size
+                except Exception:
+                    pass
+                # 保存原始像素尺寸，供头像候选排除页眉装饰线和其他极端比例图片。
+                images.append({"image": target, "thumbnail": thumb, "width": width, "height": height})
+    return lines, images
+
+
+def read_wps(path):
+    """读取旧版WPS文字文档中的正文和内嵌头像。"""
+    path = Path(path)
+    if path.stat().st_size > MAX_FILE:
+        raise ValueError(f"文件超过200MB限制：{path.name}")
+    if olefile is None:
+        raise ValueError("读取WPS文件需要安装olefile依赖")
+    try:
+        with olefile.OleFileIO(str(path)) as archive:
+            if not archive.exists("WordDocument"):
+                raise ValueError(f"WPS文件缺少正文数据：{path.name}")
+            word = archive.openstream("WordDocument").read()
+    except OSError as exc:
+        raise ValueError(f"无法读取WPS文件：{path.name}") from exc
+
+    # 旧版WPS正文通常以UTF-16LE连续保存，并以空字符结束。
+    decoded = word.decode("utf-16le", "ignore")
+    chunks = decoded.split("\x00")
+    content = max(chunks, key=lambda value: (
+        value.count("\r") + value.count("\n"),
+        len(re.findall(r"[\u4e00-\u9fff]", value)),
+    ), default="")
+    content = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9，。；：、（）()“”‘’\-—\r\n\t ]", "", content)
+    lines = [line.strip() for line in re.split(r"[\r\n]+", content) if line.strip()]
+
+    images = []
+    signatures = ((b"\x89PNG\r\n\x1a\n", "png"), (b"\xff\xd8\xff", "jpg"))
+    offsets = sorted({offset for signature, _ in signatures
+                      for offset in [word.find(signature)] if offset >= 0})
+    for index, offset in enumerate(offsets, 1):
+        try:
+            with Image.open(io.BytesIO(word[offset:])) as image:
+                image = ImageOps.exif_transpose(image)
+                image.load()
+                output = io.BytesIO()
+                image.save(output, "PNG")
+                data = output.getvalue()
+        except Exception:
+            continue
+        # 提取文件保存在上传任务目录，供后续PPT生成阶段读取。
+        target = path.with_name(f"{path.stem}.autoppt-{index}.png")
+        target.write_bytes(data)
+        images.append({"image": "file:" + str(target.resolve()), "thumbnail": image_thumbnail(data)})
     return lines, images
 
 
@@ -232,7 +293,7 @@ def unpack_experts(path, destination):
             if normalized.startswith("/") or ".." in normalized.split("/") or ":" in normalized:
                 raise ValueError("压缩包包含不安全路径")
             leaf = Path(normalized).name
-            if leaf.startswith("~$") or Path(leaf).suffix.lower() not in (".pptx", ".docx"):
+            if leaf.startswith("~$") or Path(leaf).suffix.lower() not in (".pptx", ".docx", ".wps"):
                 continue
             target = destination / f"{index:03d}_{leaf}"
             target.write_bytes(archive.read(entry))

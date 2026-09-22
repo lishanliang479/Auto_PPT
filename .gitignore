@@ -4,3 +4,12 @@ __pycache__/
 work/
 output/
 .build/
+input/
+input1/
+input2/
+release/
+*.zip
+*.pptx
+*.docx
+*.wps
+*.exe

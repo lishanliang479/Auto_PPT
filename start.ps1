@@ -9,8 +9,12 @@ $taskPythonCommand = Get-Command python -ErrorAction SilentlyContinue
 if ($taskPythonCommand) { $taskPythonPaths += $taskPythonCommand.Source }
 foreach ($taskPythonPath in $taskPythonPaths) {
     if (Test-Path -LiteralPath $taskPythonPath) {
-        & $taskPythonPath -c 'import lxml, PIL' 2>$null
-        if ($LASTEXITCODE -eq 0) {
+        # 旧版WPS专家资料依赖olefile，启动前与基础组件一并检查。
+        $ErrorActionPreference = 'Continue'
+        & $taskPythonPath -c 'import lxml, PIL, olefile' 2>$null
+        $taskDependencyExitCode = $LASTEXITCODE
+        $ErrorActionPreference = 'Stop'
+        if ($taskDependencyExitCode -eq 0) {
             & $taskPythonPath app.py
             exit $LASTEXITCODE
         }

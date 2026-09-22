@@ -13,7 +13,7 @@ def main():
     parser.add_argument("--input", type=Path, help="包含日程、模板和专家资料的目录")
     parser.add_argument("--template", type=Path, help="显式指定模板PPTX")
     parser.add_argument("--agenda", type=Path, help="显式指定日程PPTX")
-    parser.add_argument("--experts", type=Path, nargs="+", help="专家DOCX、PPTX或ZIP文件")
+    parser.add_argument("--experts", type=Path, nargs="+", help="专家DOCX、WPS、PPTX或ZIP文件")
     parser.add_argument("--output", type=Path, default=Path("output/会议串场.pptx"))
     parser.add_argument("--analyze-only", action="store_true", help="只输出识别结果")
     parser.add_argument("--draft", action="store_true", help="缺少简介时生成标有待补充内容的版本")

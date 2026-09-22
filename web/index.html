@@ -3,18 +3,18 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AutoPPT · 会议串场工作台</title>
+  <title>AutoPPT · 会议内容工作台</title>
   <link rel="stylesheet" href="/style.css">
   <script src="/app.js" defer></script>
 </head>
 <body>
   <aside class="sidebar">
-    <a class="brand" href="/"><span class="brand-mark">A</span><span>AutoPPT<small>会议串场工作台</small></span></a>
+    <a class="brand" href="/"><span class="brand-mark">A</span><span>AutoPPT<small>会议内容工作台</small></span></a>
     <div class="nav-caption">制作流程</div>
     <nav aria-label="制作步骤">
-      <button class="step active" data-step="upload"><span>01</span>导入会议资料</button>
+      <button class="step active" data-step="upload"><span>01</span>选择制作功能</button>
       <button class="step" data-step="review"><span>02</span>核对识别结果</button>
-      <button class="step" data-step="result"><span>03</span>获取会议PPT</button>
+      <button class="step" data-step="result"><span>03</span>获取成品文件</button>
     </nav>
     <div class="sidebar-note"><span class="local-dot"></span>本地运行<small>资料保存在本机<br>零大模型调用 · 无API费用</small></div>
   </aside>
@@ -23,18 +23,33 @@
     <div id="notice" class="notice" role="status" hidden></div>
     <section id="upload" class="page">
       <div class="eyebrow">FROM MATERIALS TO MEETING</div>
-      <h1>资料放进来，<br><span>会议PPT准备好。</span></h1>
-      <p class="lead">上传专家简介、会议日程和本次模板。自动识别页面、匹配专家，沿用模板版式生成可编辑PPT。</p>
-      <form id="upload-form">
+      <h1>上传会议资料，<br><span>生成PPT或会议海报。</span></h1>
+      <div class="tool-switch" role="tablist"><button class="selected" data-tool="ppt">生成会议PPT</button><button data-tool="poster">生成会议海报</button></div>
+      <div id="ppt-tool" class="tool-panel">
+        <p class="lead">上传专家简介、会议日程和本次模板。自动识别页面、匹配专家，沿用模板版式生成可编辑PPT。</p>
+        <form id="upload-form">
         <div class="upload-grid">
-          <label class="upload-card"><span class="file-symbol">01</span><h2>专家简介</h2><p>多份文件，或一个压缩包</p><span class="format">PPTX / DOCX / ZIP</span><input name="experts" type="file" accept=".pptx,.docx,.zip" multiple required><span class="file-state">点击选择专家资料</span></label>
+          <label class="upload-card"><span class="file-symbol">01</span><h2>专家简介</h2><p>多份文件，或一个压缩包</p><span class="format">PPTX / DOCX / WPS / ZIP</span><input name="experts" type="file" accept=".pptx,.docx,.wps,.zip" multiple required><span class="file-state">点击选择专家资料</span></label>
           <label class="upload-card"><span class="file-symbol">02</span><h2>会议日程</h2><p>包含时间、讲题和参会专家</p><span class="format">PPTX</span><input name="agenda" type="file" accept=".pptx" required><span class="file-state">点击选择会议日程</span></label>
           <label class="upload-card"><span class="file-symbol">03</span><h2>PPT模板</h2><p>含各类页面的现有串场PPT</p><span class="format">PPTX</span><input name="template" type="file" accept=".pptx" required><span class="file-state">点击选择本次模板</span></label>
         </div>
         <div class="upload-bottom"><span>每次可使用不同模板 · 单文件最大200MB</span><button class="primary" type="submit">开始识别 <span>↗</span></button></div>
-      </form>
-      <div id="samples" class="samples"></div>
-      <div class="feature-row"><div><strong>保留原模板</strong><span>复制原页面，保留背景与装饰</span></div><div><strong>固定八行</strong><span>临床信息优先，学校履历和重要任职顺序补充</span></div><div><strong>异常集中处理</strong><span>缺少资料时提示，不填入旧专家内容</span></div></div>
+        </form>
+        <div id="samples" class="samples"></div>
+        <div class="feature-row"><div><strong>保留原模板</strong><span>复制原页面，保留背景与装饰</span></div><div><strong>最多八条</strong><span>临床信息优先，学校履历、重要任职和专业介绍顺序补充</span></div><div><strong>异常集中处理</strong><span>缺少资料时提示，不填入旧专家内容</span></div></div>
+      </div>
+      <div id="poster-tool" class="tool-panel" hidden>
+        <p class="lead">上传专家头像、日程图片和海报模板。系统在本机识别日程文字，自动匹配姓名与头像，生成高清PNG海报。</p>
+        <form id="poster-upload-form">
+          <div class="upload-grid">
+            <label class="upload-card"><span class="file-symbol">01</span><h2>专家头像</h2><p>文件名使用专家姓名，可上传压缩包或多张图片</p><span class="format">ZIP / PNG / JPG / WEBP</span><input name="poster_experts" type="file" accept=".zip,.png,.jpg,.jpeg,.webp" multiple required><span class="file-state">点击选择专家头像</span></label>
+            <label class="upload-card"><span class="file-symbol">02</span><h2>日程图片</h2><p>包含会议时间、议题、讲者和主持信息</p><span class="format">PNG / JPG / WEBP</span><input name="poster_agenda" type="file" accept=".png,.jpg,.jpeg,.webp" required><span class="file-state">点击选择日程图片</span></label>
+            <label class="upload-card"><span class="file-symbol">03</span><h2>海报模板</h2><p>系统提取模板比例、主色和背景质感</p><span class="format">PNG / JPG / WEBP</span><input name="poster_template" type="file" accept=".png,.jpg,.jpeg,.webp" required><span class="file-state">点击选择海报模板</span></label>
+          </div>
+          <div class="upload-bottom"><span>OCR与头像处理全部在本机完成</span><button class="primary" type="submit">识别海报资料 <span>↗</span></button></div>
+        </form>
+        <div class="feature-row"><div><strong>自动识别日程</strong><span>读取会议标题、日期、会议号、主持和各时间段</span></div><div><strong>姓名匹配头像</strong><span>根据头像文件名匹配主席、主持、讲者和嘉宾</span></div><div><strong>高清PNG输出</strong><span>按模板比例排版，生成可直接发布的海报图片</span></div></div>
+      </div>
     </section>
     <section id="review" class="page" hidden>
       <div class="section-head"><div><div class="eyebrow">REVIEW & BUILD</div><h1>核对本次会议</h1><p class="lead">识别结果可直接修改。模板中的特殊页面和模糊区域可在下方确认。</p></div><button class="secondary" id="back-upload">重新导入</button></div>
@@ -48,8 +63,17 @@
       <div id="experts-panel" class="tab-panel" hidden><div id="experts-list"></div></div>
       <div id="template-panel" class="tab-panel" hidden><p class="hint">以下为对象结构预览，图片和文本位置来自模板；最终显示效果以PowerPoint或WPS为准。可调整页面用途和填充区域。</p><div id="template-list" class="template-grid"></div></div>
       <!-- 主席简介和待核对模式默认启用，讨论话题页由用户按需要勾选。 -->
-      <div class="panel options"><h2>生成设置</h2><label><input type="checkbox" id="option-repeat" checked>总结后再次展示主席简介</label><label><input type="checkbox" id="option-topics">每场讨论保留模板中的讨论话题页</label><label><input type="checkbox" id="option-draft" checked>允许缺少专家简介，生成待核对版本</label><p class="hint">每位专家固定8行，正文统一使用16磅字号。首行是医院、科室及职务职称，之后优先放学历或学校履历，再按重要程度补充其他任职。学校履历缺失时直接承接其他任职。原资料总量不足时显示待补充项。照片等比放大并居中裁切，充满图片框，不自动抠图。</p></div>
+      <div class="panel options"><h2>生成设置</h2><label><input type="checkbox" id="option-repeat" checked>总结后再次展示主席简介</label><label><input type="checkbox" id="option-topics">每场讨论保留模板中的讨论话题页</label><label><input type="checkbox" id="option-draft" checked>允许缺少专家简介，生成待核对版本</label><p class="hint">每位专家最多显示8条，正文统一使用16磅字号。首行是医院、科室及职务职称，之后优先放学历或学校履历，再按重要程度补充其他任职、研究方向、擅长领域和个人介绍。资料未提供的类别不显示。照片等比放大并居中裁切，充满图片框，不自动抠图。</p></div>
       <div class="sticky-actions"><span id="generation-note">沿用本次模板，生成可编辑PPT</span><button id="generate" class="primary">生成会议PPT <span>↗</span></button></div>
+    </section>
+    <section id="poster-review" class="page" hidden>
+      <div class="section-head"><div><div class="eyebrow">REVIEW POSTER</div><h1>核对海报内容</h1><p class="lead">OCR结果可以直接修改，头像角色与专家信息也可调整。</p></div><button class="secondary" id="poster-back-upload">重新导入</button></div>
+      <div id="poster-stats" class="stats"></div>
+      <details id="poster-issues-box" class="issues-box"><summary id="poster-issues-summary">识别提示</summary><div id="poster-issues"></div></details>
+      <div class="panel"><h2>会议信息</h2><div class="form-grid poster-meta"><label>会议名称<input id="poster-title"></label><label>会议日期<input id="poster-date"></label><label>会议时间<input id="poster-time"></label><label>腾讯会议<input id="poster-code"></label><label>主办单位<input id="poster-organizer"></label><label>会议主席<input id="poster-chairs"></label></div></div>
+      <div class="panel"><div class="panel-title"><h2>会议日程</h2><button id="poster-add-event" class="secondary small">添加环节</button></div><div class="table-scroll"><table><thead><tr><th>时间</th><th>环节</th><th>主题</th><th>讲者或嘉宾</th><th>主持</th><th></th></tr></thead><tbody id="poster-agenda-body"></tbody></table></div></div>
+      <div class="panel"><h2>专家头像与分组</h2><div id="poster-experts-list" class="poster-experts"></div></div>
+      <div class="sticky-actions"><span>生成高清PNG海报</span><button id="poster-generate" class="primary">生成会议海报 <span>↗</span></button></div>
     </section>
     <section id="result" class="page" hidden>
       <div class="success-mark">✓</div><div class="eyebrow">READY TO DOWNLOAD</div><h1>会议PPT已生成</h1><p class="lead" id="result-description"></p>
@@ -58,6 +82,11 @@
       <div id="result-issues" class="issues-box"></div>
       <div class="result-actions"><a id="report-download" class="secondary">下载核对报告</a><button id="back-review" class="secondary">返回修改</button></div>
       <h2 class="preview-heading">生成页面结构预览</h2><p class="hint">已完成文件结构和人员内容校验。结构预览不等同于Office渲染，请在正式会议前检查实际播放效果。</p><div id="output-preview" class="template-grid"></div>
+    </section>
+    <section id="poster-result" class="page" hidden>
+      <div class="success-mark">✓</div><div class="eyebrow">POSTER READY</div><h1>会议海报已生成</h1><p class="lead">已完成头像匹配、分组和日程排版，可以预览并下载高清PNG文件。</p>
+      <div id="poster-result-stats" class="stats"></div>
+      <div class="poster-output"><img id="poster-preview" alt="生成的会议海报预览"><div><strong>会议海报.png</strong><p>高清PNG图片，可用于公众号、社群和会议通知</p><a id="poster-download" class="primary">下载海报 ↗</a><button id="poster-back-review" class="secondary">返回修改</button></div></div>
     </section>
     <div id="busy" class="busy" hidden><div class="spinner"></div><h2 id="busy-title">正在分析会议资料</h2><p id="busy-message">文件仅在本机处理</p><span class="pill">0 AI CALLS</span></div>
   </main>

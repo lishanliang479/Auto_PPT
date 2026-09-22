@@ -15,11 +15,12 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from autoppt.analyze import analyze, analyze_template, discover, names_in, parse_agenda, read_expert
+from autoppt.analyze import analyze, analyze_template, discover, filename_name, names_in, parse_agenda, read_expert
 from autoppt.bio import summarize_bio
-from autoppt.generate import generate, page_plan, photo_frame_shape, validate_model
+from autoppt.generate import generate, page_plan, photo_frame_shape, portrait_bytes, validate_model
 from autoppt.ooxml import NS, compact, encoded, read_deck, read_package, unpack_experts, xml
-from autoppt.server import Handler, TOKEN, ThreadingHTTPServer, apply_edits
+from autoppt.poster import clean_name, organizer_from_logo, render_poster, unpack_portraits
+from autoppt.server import Handler, TOKEN, ThreadingHTTPServer, apply_edits, apply_poster_edits, ppt_output_filename
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -32,6 +33,105 @@ class RuleTests(unittest.TestCase):
     def test_adjacent_names_without_separator(self):
         self.assertEqual(names_in('杜忠海教授刘新会教授杨金霞教授赵倩教授祝守慧教授'), ['杜忠海', '刘新会', '杨金霞', '赵倩', '祝守慧'])
 
+    def test_filename_name_ignores_date_and_role(self):
+        # 日期和角色紧贴姓名时，仍应稳定提取真实专家姓名。
+        cases = {
+            '000_10-0904孟洪正 讨论.docx': '孟洪正',
+            '001_1-0904主持  孙华强.docx': '孙华强',
+            '002_2-0904吴昊讲者.docx': '吴昊',
+            '003_3-0904张培根讨论.docx': '张培根',
+            '005_5-0904于鑫 讲者.docx': '于鑫',
+            '006_6-0904李军讨论.wps': '李军',
+            '007_7-0904杨楠楠 讨论嘉宾.docx': '杨楠楠',
+            '009_9-0904刘欢讨论.docx': '刘欢',
+        }
+        for source, expected in cases.items():
+            self.assertEqual(filename_name(source), expected)
+
+    def test_long_social_paragraph_splits_into_eight_lines(self):
+        # 逗号、顿号和分号连接的任职应拆为独立条目，避免整段占用一行。
+        expert = {'name': '李军', 'hospital': '', 'bio': [
+            '讨论',
+            '骨伤一科（关节运动医学科）主任医师。',
+            '中国中西医结合学会骨科微创专业委员会委员，中国中西医结合学会疼痛专业委员会委员、'
+            '中华中医药学会筋膜学协同创新共同体委员；中国中医药研究促进会骨质疏松分会理事，'
+            '中国民族医药学会骨伤分会理事，山东中医药学会骨伤分会常委委员。',
+        ]}
+        summary = summarize_bio(expert)
+        self.assertEqual(len(summary['lines']), 7)
+        self.assertEqual(summary['lines'][0], '骨伤一科（关节运动医学科），主任医师')
+        self.assertIn('中国中西医结合学会骨科微创专业委员会委员', summary['lines'])
+        self.assertTrue(all('，中国' not in line and '、中华' not in line for line in summary['lines']))
+
+    def test_meeting_role_removed_and_prose_keeps_commas(self):
+        # 会议角色不进入个人简介，普通叙述中的逗号继续属于同一句话。
+        summary = summarize_bio({'name': '张培根', 'hospital': '甲医院', 'bio': [
+            '讨论嘉宾', '甲医院副主任医师',
+            '长期从事老年慢性疾病的诊治工作，对老年多发病，常见病的防治有较深的造诣。']})
+        self.assertNotIn('讨论嘉宾', summary['lines'])
+        self.assertIn('长期从事老年慢性疾病的诊治工作，对老年多发病，常见病的防治有较深的造诣', summary['lines'])
+        self.assertFalse(any('资料未提供' in line or '待补充' in line for line in summary['lines']))
+
+    def test_mixed_paragraph_keeps_hospital_and_title_first(self):
+        # 同一长段落含医院、职称和学会任职时，首行仍由医院及临床职称组成。
+        summary = summarize_bio({'name': '刘江', 'hospital': '山东省第二人民医院', 'bio': [
+            '山东省第二人民医院关节外科二区主任，副主任医师，医学博士，博士后。'
+            '山东省医学会骨科分会委员。擅长关节置换术。']})
+        self.assertEqual(summary['lines'][0], '山东省第二人民医院关节外科二区主任，副主任医师')
+        self.assertEqual(summary['lines'][1], '医学博士，博士后')
+
+    def test_professor_and_clinical_title_share_first_line(self):
+        # 教授与主任医师均为专家职称，应与医院合并显示在首行。
+        summary = summarize_bio({'name': '刁维珍', 'hospital': '山东中医药大学附属医院', 'bio': [
+            '山东中医药大学附属医院主任医师、教授。任康复科主任。临证四十余年，擅长康复治疗。']})
+        self.assertEqual(summary['lines'][0], '山东中医药大学附属医院，主任医师、教授')
+        self.assertIn('临证四十余年，擅长康复治疗', summary['lines'])
+
+    def test_picture_fill_and_docx_decorations(self):
+        # 真实问题样本同时覆盖形状图片填充和Word装饰线，确保自动选择可用头像。
+        profiles = ROOT / 'input' / '9.15百利天恒 线上会议' / '专家简介'
+        filled_shape = profiles / '1-程金刚简介.pptx'
+        decorated_docx = profiles / '9-贾亦斌简介.docx'
+        if not filled_shape.exists() or not decorated_docx.exists():
+            self.skipTest('9.15头像识别样本未放入项目')
+        ppt_expert = read_expert(filled_shape)
+        docx_expert = read_expert(decorated_docx)
+        self.assertEqual(ppt_expert['photos'][0]['image'], 'ppt/media/image2.jpeg')
+        self.assertGreater(ppt_expert['photos'][0]['score'], ppt_expert['photos'][1]['score'])
+        self.assertEqual(docx_expert['photos'][0]['image'], 'word/media/image2.jpeg')
+        self.assertTrue(docx_expert['photo_confirmed'])
+
+    def test_agenda_title_from_header_image(self):
+        # 日程标题转成顶部横幅图片时，使用本地OCR恢复完整会议名称。
+        source = ROOT / 'input' / '9.21康弘' / '9.21康弘日程.pptx'
+        if not source.exists():
+            self.skipTest('9.21图片标题样本未放入项目')
+        agenda = parse_agenda(source, [])
+        self.assertEqual(agenda['title'], '汇智齐鲁，共护慢病全域慢病防治与综合管理学术研讨会')
+
+    def test_generated_filename_uses_meeting_title_and_time(self):
+        # 下载文件名包含会议名称、日期及首尾日程时间，并清除Windows禁用字符。
+        model = {'agenda': {'title': '汇智齐鲁，共护慢病', 'date': '2026年9月21日', 'events': [
+            {'time': '19:00-19:10'}, {'time': '20:20-20:30'}]}}
+        self.assertEqual(ppt_output_filename(model),
+                         '汇智齐鲁，共护慢病2026年9月21日19时00分至20时30分.pptx')
+        model['agenda']['title'] = '研讨会:A/B'
+        self.assertNotRegex(ppt_output_filename(model), r'[<>:"/\\|?*]')
+
+    def test_narrow_portrait_keeps_head(self):
+        # 窄幅全身照填充较宽照片框时从顶部裁切，头部区域继续保留在输出中。
+        source = ROOT / 'input' / '9.8费卡庞经理' / '9.8费卡专家简介' / '10-0908丁红光.docx'
+        if not source.exists():
+            self.skipTest('9.8窄幅头像样本未放入项目')
+        expert = read_expert(source)
+        data = portrait_bytes(expert, 2160000 / 2876400)
+        with Image.open(io.BytesIO(data)) as output:
+            self.assertEqual(output.size, (451, 600))
+            # 原图头部位于顶部中央，输出相同位置应保留肤色像素。
+            red, green, blue = output.convert('RGB').getpixel((225, 70))
+            self.assertGreater(red, green)
+            self.assertGreater(green, blue)
+
     def test_zip_path_traversal(self):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / 'bad.zip'
@@ -40,6 +140,55 @@ class RuleTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '不安全'):
                 unpack_experts(source, Path(temp) / 'safe')
             self.assertFalse((Path(temp) / 'outside.docx').exists())
+
+    def test_poster_portrait_zip_and_name(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / 'portraits.zip'
+            image = io.BytesIO()
+            Image.new('RGB', (40, 60), 'white').save(image, 'PNG')
+            with zipfile.ZipFile(source, 'w') as archive:
+                archive.writestr('头像/01_张三教授.png', image.getvalue())
+            portraits = unpack_portraits([source], root / 'expanded')
+            self.assertEqual(len(portraits), 1)
+            self.assertEqual(clean_name('01_张三教授.png'), '张三')
+
+    def test_poster_logo_unit_mapping(self):
+        # 标志简称在日程左上角被识别后，可稳定映射为正式主办单位名称。
+        items = [{'text': 'SSPCA', 'bbox': [10, 10, 80, 30]}]
+        self.assertEqual(organizer_from_logo(items, 1000, 1600), '山东省亚健康防治协会')
+
+    def test_poster_edits_keep_server_paths(self):
+        original = {'agenda': {'title': '甲会议', 'date': '', 'meeting_time': '', 'meeting_code': '',
+                               'venue': '', 'organizer': '', 'chairs': ['张三'], 'events': [
+                                   {'time': '10:00-10:20', 'kind': 'talk', 'title': '甲',
+                                    'people': ['张三'], 'hosts': []}]},
+                    'experts': [{'name': '张三', 'hospital': '甲医院', 'display_title': '教授',
+                                 'role': 'speaker', 'path': 'C:/safe/photo.png'}]}
+        incoming = copy.deepcopy(original)
+        incoming['experts'][0].update(name='李四', path='C:/unsafe/replaced.png')
+        updated = apply_poster_edits(original, incoming)
+        self.assertEqual(updated['experts'][0]['path'], 'C:/safe/photo.png')
+        self.assertEqual(updated['agenda']['events'][0]['people'], ['李四'])
+
+    def test_render_poster_png(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            template, portrait, output = root / 'template.jpg', root / '张三.png', root / 'poster.png'
+            Image.new('RGB', (900, 1800), '#f4d9ef').save(template)
+            Image.new('RGB', (300, 420), '#dbe8f4').save(portrait)
+            model = {'template': {'path': str(template)}, 'agenda': {
+                'title': '测试会议', 'date': '2026年9月20日', 'meeting_time': '10:00-10:20',
+                'meeting_code': '123-456-789', 'organizer': '测试单位', 'events': [
+                    {'time': '10:00-10:20', 'kind': 'talk', 'title': '测试讲题',
+                     'people': ['张三'], 'hosts': []}]},
+                'experts': [{'name': '张三', 'hospital': '甲医院', 'display_title': '教授',
+                             'role': 'speaker', 'path': str(portrait)}]}
+            report = render_poster(model, output)
+            self.assertTrue(output.exists())
+            with Image.open(output) as image:
+                self.assertEqual(image.format, 'PNG')
+                self.assertEqual(image.size, (report['width'], report['height']))
 
 
 @unittest.skipUnless((ROOT / 'input1').exists(), '真实资料未放入项目')
@@ -51,7 +200,13 @@ class PipelineTests(unittest.TestCase):
         cls.models = {}
         cls.hashes = {}
         for name in ('input', 'input1'):
-            template, agenda, experts = discover(ROOT / name)
+            if name == 'input':
+                # input目录包含多批历史资料，测试固定使用原有9月7日样例。
+                template = ROOT / 'input' / '串场PPT模板.pptx'
+                agenda = ROOT / 'input' / '9.7费卡华瑞日程.pptx'
+                experts = [ROOT / 'input' / '专家简介.zip']
+            else:
+                template, agenda, experts = discover(ROOT / name)
             cls.models[name] = analyze(template, agenda, experts, cls.work / name)
             cls.hashes[template] = hashlib.sha256(template.read_bytes()).hexdigest()
         cls.output = cls.work / 'meeting.pptx'
@@ -86,11 +241,12 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(model['agenda']['events']), 6)
         self.assertEqual(model['agenda']['events'][4]['people'], ['李磊', '朱帅'])
         self.assertEqual(model['agenda']['people']['朱帅']['hospital'], '山东大学齐鲁医院德州医院')
-        # 关闭待核对模式后，缺少简介仍然需要阻止正式生成。
+        # 缺少简介时继续生成，并在校验提示中说明待补充人员。
         model = copy.deepcopy(model)
         model['options']['draft'] = False
-        with self.assertRaisesRegex(ValueError, '缺少专家简介：朱帅'):
-            validate_model(model)
+        missing, warnings = validate_model(model)
+        self.assertIn('朱帅', missing)
+        self.assertTrue(any(item['code'] == 'missing_expert' for item in warnings))
 
     def test_paragraph_breaks(self):
         expert = next(e for e in self.models['input1']['experts'] if e['name'] == '尹贻波')
@@ -131,7 +287,8 @@ class PipelineTests(unittest.TestCase):
             if not spec.get('expert'):
                 continue
             self.assertEqual(spec['continuation'], 1)
-            self.assertEqual(len(spec['selected_bio']), 8)
+            self.assertGreaterEqual(len(spec['selected_bio']), 1)
+            self.assertLessEqual(len(spec['selected_bio']), 8)
             for line in spec['selected_bio']:
                 self.assertIn(compact(line), compact(slide['text']))
             source = model['template']['slides'][spec['template_slide'] - 1]
@@ -141,11 +298,14 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(body['font'], 16)
 
     def test_summary_keeps_source_in_report(self):
+        used = {page.get('expert') for page in self.report['pages'] if page.get('expert')}
         for expert in self.models['input1']['experts']:
+            if expert['name'] not in used:
+                continue
             summary = self.report['bio_summaries'][expert['name']][0]
             self.assertGreaterEqual(len(summary['source']), len(summary['selected_social']))
             self.assertEqual(summary['source'], expert['bio'])
-            self.assertEqual(len(summary['lines']), 8)
+            self.assertLessEqual(len(summary['lines']), 8)
 
     def test_mixed_clinical_and_school_credentials(self):
         expert = {'name': '测试', 'hospital': '甲医院', 'bio': [
@@ -156,18 +316,18 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('博士生导师', summary['lines'][1])
         self.assertNotIn('医师', summary['lines'][1])
         self.assertEqual(summary['lines'][2], '中国医学会副主任委员')
-        self.assertEqual(len(summary['lines']), 8)
+        self.assertLessEqual(len(summary['lines']), 8)
 
     def test_missing_school_is_blank_and_not_invented(self):
         summary = summarize_bio({'name': '测试', 'hospital': '甲医院', 'bio': ['甲医院消化科主治医师', '中国医学会委员']})
         self.assertEqual(summary['lines'][1], '中国医学会委员')
         self.assertIn('学历或学校相关履历', summary['missing'])
 
-    def test_every_summary_has_eight_nonempty_lines(self):
+    def test_every_summary_has_at_most_eight_nonempty_lines(self):
         for model in self.models.values():
             for expert in model['experts']:
                 summary = summarize_bio(expert)
-                self.assertEqual(len(summary['lines']), 8, expert['name'])
+                self.assertLessEqual(len(summary['lines']), 8, expert['name'])
                 self.assertTrue(all(line.strip() for line in summary['lines']), expert['name'])
                 self.assertFalse(any(line in {'课题', '专业特长', '学术任职'} for line in summary['lines']), expert['name'])
 
@@ -197,12 +357,18 @@ class PipelineTests(unittest.TestCase):
 
     def test_replacement_photo_fills_frame(self):
         package = read_package(self.output)
+        experts = {expert['name']: expert for expert in self.models['input1']['experts']}
         for slide, spec in zip(self.deck['slides'], self.report['pages']):
             if not spec.get('expert'):
                 continue
             source = self.models['input1']['template']['slides'][spec['template_slide'] - 1]
-            picture = next(s for s in slide['shapes'] if s['id'] == source['fields']['photo'])
-            source_picture = next(s for s in source['shapes'] if s['id'] == source['fields']['photo'])
+            photo_field = spec['fields'].get('photo')
+            person = experts.get(spec['expert'])
+            if not photo_field or not person or not person.get('photo'):
+                self.assertFalse(any(s['id'] == photo_field for s in slide['shapes']))
+                continue
+            picture = next(s for s in slide['shapes'] if s['id'] == photo_field)
+            source_picture = next(s for s in source['shapes'] if s['id'] == photo_field)
             frame = photo_frame_shape(source, source_picture)
             expected_bbox = frame['bbox'] if frame else source_picture['bbox']
             self.assertEqual(picture['bbox'], expected_bbox)
@@ -243,28 +409,28 @@ class PipelineTests(unittest.TestCase):
         pairs = [(s, p) for s, p in zip(deck['slides'], report['pages']) if p.get('expert') == '朱帅']
         self.assertEqual(len(pairs), 1)
         self.assertIn('简介待补充', pairs[0][0]['text'])
-        self.assertEqual(len([s for s in pairs[0][0]['shapes'] if s['kind'] == 'pic']), 1)
+        self.assertFalse(any(s['id'] == pairs[0][1]['fields'].get('photo') for s in pairs[0][0]['shapes']))
 
-    def test_time_overlap_blocks(self):
+    def test_time_overlap_becomes_warning(self):
         model = copy.deepcopy(self.models['input1'])
         model['agenda']['events'][1]['time'] = '19:05-19:40'
-        with self.assertRaisesRegex(ValueError, '重叠'):
-            validate_model(model)
+        _, warnings = validate_model(model)
+        self.assertTrue(any(item['code'] == 'event_time_order' for item in warnings))
 
-    def test_ambiguous_photo_requires_confirmation(self):
+    def test_ambiguous_photo_becomes_warning(self):
         model = copy.deepcopy(self.models['input1'])
-        # 正式模式下仍需确认存在歧义的候选照片。
+        # 正式模式下保留候选照片提示，同时允许生成当前首选照片。
         model['options']['draft'] = False
         model['experts'][0]['photo_confirmed'] = False
-        with self.assertRaisesRegex(ValueError, '候选照片'):
-            validate_model(model)
+        _, warnings = validate_model(model)
+        self.assertTrue(any(item['code'] == 'photo_unconfirmed' for item in warnings))
 
-    def test_duplicate_field_binding_blocks(self):
+    def test_duplicate_field_binding_becomes_warning(self):
         model = copy.deepcopy(self.models['input1'])
         fields = model['template']['slides'][2]['fields']
         fields['bio'] = fields['identity']
-        with self.assertRaisesRegex(ValueError, '同一区域'):
-            validate_model(model)
+        _, warnings = validate_model(model)
+        self.assertTrue(any(item['code'] == 'template_field_duplicate' for item in warnings))
 
     def test_template_profile_cache_reused(self):
         model = self.models['input1']
@@ -276,11 +442,48 @@ class PipelineTests(unittest.TestCase):
         repeated = analyze(template, agenda, experts, self.work / 'cached', cache)
         self.assertTrue(repeated['template']['cache_used'])
 
-    def test_incomplete_template_blocks(self):
+    def test_incomplete_template_mapping_is_repaired(self):
         model = copy.deepcopy(self.models['input1'])
         model['template']['slides'][5]['fields'].pop('bio')
-        with self.assertRaisesRegex(ValueError, 'bio'):
-            page_plan(model)
+        plan = page_plan(model)
+        speaker = next(item for item in plan if item['role'] == 'speaker')
+        self.assertTrue(speaker['fields'].get('bio'))
+
+    def test_missing_meeting_title_still_generates(self):
+        model = copy.deepcopy(self.models['input1'])
+        model['agenda']['title'] = ''
+        path = self.work / 'missing-title.pptx'
+        report = generate(model, path)
+        self.assertTrue(path.exists())
+        self.assertTrue(any(item['code'] == 'meeting_title_empty' for item in report['issues']))
+
+    def test_recent_templates_all_have_generation_plan(self):
+        folder = ROOT / 'input' / 'ppt模板'
+        if not folder.exists():
+            self.skipTest('最近模板未放入项目')
+        for path in folder.glob('*.pptx'):
+            with self.subTest(template=path.name):
+                model = copy.deepcopy(self.models['input1'])
+                model['template'] = analyze_template(path)
+                plan = page_plan(model)
+                self.assertGreaterEqual(len(plan), 2)
+                self.assertEqual(plan[0]['role'], 'cover')
+                self.assertEqual(plan[-1]['role'], 'ending')
+
+    def test_ending_page_clears_old_title_and_date(self):
+        # 新会议缺少名称和日期时，结束页中的模板旧会议信息也应清空。
+        template = ROOT / 'input' / 'ppt模板' / '康缘王立鹏基层多学科串场.pptx'
+        if not template.exists():
+            self.skipTest('带旧标题和日期的结束页模板未放入项目')
+        model = copy.deepcopy(self.models['input1'])
+        model['template'] = analyze_template(template)
+        model['agenda']['title'] = ''
+        model['agenda']['date'] = ''
+        target = self.work / 'blank-ending-metadata.pptx'
+        generate(model, target)
+        ending = read_deck(target)['slides'][-1]['text']
+        self.assertNotIn('基层多学科常见病规范化诊疗能力提升系列学术交流会', ending)
+        self.assertNotIn('2026年8月27日', ending)
 
     def test_client_cannot_replace_server_paths(self):
         original = self.models['input1']

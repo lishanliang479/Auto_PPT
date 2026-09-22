@@ -17,7 +17,7 @@ from pathlib import Path
 from lxml import etree as ET
 from PIL import Image, ImageFont, ImageOps
 
-from .analyze import DATE, ROLES, issue, names_in
+from .analyze import DATE, EVENT_ROLES, PERSON_ROLES, ROLES, infer_slide_fields, issue, names_in
 from .bio import summarize_bio
 from .ooxml import NS, compact, encoded, paragraphs, read_deck, read_package, rel_path, resolve, tag, xml
 
@@ -212,60 +212,86 @@ def fit_lines(node, shape, lines, minimum=14):
 
 
 def select_single_page_bio(node, shape, person, font_size=16):
-    """使用固定字号放置八行简介，不生成续页或截断任职名称。"""
+    """优先使用指定字号放置简介，极小区域自动缩放并保留可生成结果。"""
     width, height, _, family = text_box(node, shape)
     summary = summarize_bio(person)
     lines = summary['lines'][:]
     size = int(font_size)
     line_spacing = 1.8
-    # 专家简介统一使用16磅和180%行距，容量不足时提示调整内容或模板。
-    if (estimated_height(lines, width, size, family, node, line_spacing) > height
-            or any(text_width(x, measure_font(size, family)) > width for x in lines)):
-        raise ValueError(f"{person['name']}的八行简介无法以{size}磅逐行放入模板，请精简原文或调整模板简介区域")
+    # 长研究方向需要自动换行时，先减少低优先级社会任职，保留个人专业介绍。
+    while len(lines) > 1 and estimated_height(lines, width, size, family, node, line_spacing) > height:
+        social_indexes = [index for index, value in enumerate(lines) if value in summary['social']]
+        other_selected = any(value in summary['other'] for value in lines)
+        if other_selected and social_indexes:
+            lines.pop(social_indexes[-1])
+        else:
+            lines.pop()
+    adjusted = False
+    # 模板简介框过小时逐级降低字号和行距，保证自动生成不中断。
+    while size > 10 and estimated_height(lines, width, size, family, node, line_spacing) > height:
+        size -= 1
+        adjusted = True
+    while line_spacing > 1.0 and estimated_height(lines, width, size, family, node, line_spacing) > height:
+        line_spacing = round(max(1.0, line_spacing - .1), 1)
+        adjusted = True
+    while lines and estimated_height(lines, width, size, family, node, line_spacing) > height:
+        if len(lines) > 1:
+            lines.pop()
+        elif len(lines[0]) > 12:
+            lines[0] = lines[0][:-4].rstrip("，,；;。 ") + "…"
+        else:
+            lines = []
+        adjusted = True
     selected_social = [x for x in lines if x in summary['social']]
-    summary.update(lines=lines, font=size, line_spacing=line_spacing, selected_social=selected_social,
+    summary.update(lines=lines, font=size, line_spacing=line_spacing, fit_adjusted=adjusted,
+                   selected_social=selected_social,
                    omitted_social=[x for x in summary['social'] if x not in selected_social])
     return summary
 
 
 def validate_model(model):
-    errors = []
+    warnings = []
     agenda, profile = model["agenda"], model["template"]
-    if not agenda.get("title") or not agenda.get("date"):
-        errors.append("会议名称或日期为空")
+    if not agenda.get("title"):
+        warnings.append(issue("meeting_title_empty", "会议名称为空，对应模板区域将留空"))
+    if not agenda.get("date"):
+        warnings.append(issue("meeting_date_empty", "会议日期为空，对应模板区域将留空"))
     if not agenda.get("events"):
-        errors.append("日程没有可生成的环节")
-    experts = {e["name"]: e for e in model["experts"]}
-    if len(experts) != len(model["experts"]) or "" in experts:
-        errors.append("专家姓名为空或存在同名资料")
+        warnings.append(issue("agenda_empty", "日程没有可生成的环节，本次仅生成模板封面和结束页"))
+    experts = {e.get("name", ""): e for e in model["experts"] if e.get("name")}
+    if len(experts) != len([e for e in model["experts"] if e.get("name")]):
+        warnings.append(issue("duplicate_name", "存在同名专家资料，生成时使用最后一份资料"))
+    if any(not e.get("name") for e in model["experts"]):
+        warnings.append(issue("expert_name_empty", "存在姓名为空的专家资料，生成时跳过无法匹配的资料"))
     required = set()
     previous_end = None
     for event in agenda["events"]:
-        required.update(event.get("people", []))
-        required.update(event.get("hosts", []))
+        required.update(name for name in event.get("people", []) if name)
+        required.update(name for name in event.get("hosts", []) if name)
         if event.get("kind") not in ("opening", "talk", "discussion", "summary"):
-            errors.append("日程包含不支持的环节类型")
+            warnings.append(issue("event_kind", f"{event.get('time', '')}的环节类型无法识别，按专题讲题生成"))
         if not event.get("people") or not event.get("title"):
-            errors.append(f"{event.get('time', '')}缺少人员或内容")
+            warnings.append(issue("event_incomplete", f"{event.get('time', '')}缺少人员或内容，对应区域将留空"))
         times = re.findall(r"(\d{1,2}):([0-5]\d)", event.get("time", ""))
         if len(times) != 2 or any(int(h) > 23 for h, _ in times):
-            errors.append(f"时间格式无效：{event.get('time', '')}")
+            if event.get("time"):
+                warnings.append(issue("event_time", f"时间格式需要核对：{event.get('time', '')}"))
         else:
             start, end = [int(h) * 60 + int(m) for h, m in times]
             if end <= start or (previous_end is not None and start < previous_end):
-                errors.append(f"日程时间重叠或顺序有误：{event['time']}")
+                warnings.append(issue("event_time_order", f"日程时间重叠或顺序需要核对：{event['time']}"))
             previous_end = end
     missing = sorted(required - set(experts))
-    if missing and not model["options"].get("draft"):
-        errors.append("缺少专家简介：" + "、".join(missing) + "。可补充资料或选择生成待核对版本")
+    if missing:
+        warnings.append(issue("missing_expert", "缺少专家简介：" + "、".join(missing) + "，对应简介页使用待补充内容"))
     for name in required & set(experts):
         expert = experts[name]
-        if not expert.get('photo_confirmed', True) and not model['options'].get('draft'):
-            errors.append(f'{name}有多张候选照片，请在专家资料中确认')
-        if not expert.get("bio") and not model["options"].get("draft"):
-            errors.append(f"{name}简介为空")
+        if not expert.get('photo_confirmed', True):
+            warnings.append(issue("photo_unconfirmed", f"{name}有多张候选照片，生成时使用当前首选照片", expert=name))
+        if not expert.get("bio"):
+            warnings.append(issue("bio_empty", f"{name}简介为空，对应简介区域使用待补充内容", expert=name))
         if expert.get("photo") and expert["photo"] not in [p["image"] for p in expert["photos"]]:
-            errors.append(f"{name}选择的照片不存在")
+            warnings.append(issue("photo_invalid", f"{name}选择的照片不存在，对应照片区域将留空", expert=name))
     for slide in profile["slides"]:
         if slide["role"] == "unknown":
             continue
@@ -276,73 +302,93 @@ def validate_model(model):
                 if not sid:
                     continue
                 if sid not in shapes:
-                    errors.append(f"模板第{slide['number']}页区域不存在")
-                elif field == "photo" and shapes[sid]["kind"] != "pic":
-                    errors.append(f"模板第{slide['number']}页照片区域类型无效")
+                    warnings.append(issue("template_field_invalid", f"模板第{slide['number']}页区域不存在，生成时重新识别", slide=slide["number"]))
+                elif field == "photo" and not shapes[sid].get("image"):
+                    warnings.append(issue("template_photo_invalid", f"模板第{slide['number']}页照片区域类型无效，生成时保留空白", slide=slide["number"]))
                 elif field != "photo" and shapes[sid]["kind"] != "sp":
-                    errors.append(f"模板第{slide['number']}页需要选择普通文本框")
+                    warnings.append(issue("template_text_invalid", f"模板第{slide['number']}页文字区域无法编辑，生成时保留原布局", slide=slide["number"]))
                 if field not in ("meeting", "metadata"):
                     assigned.append(sid)
         if len(set(assigned)) != len(assigned):
-            errors.append(f"模板第{slide['number']}页多个字段使用了同一区域")
-    if errors:
-        raise ValueError("；".join(errors))
-    return missing
+            warnings.append(issue("template_field_duplicate", f"模板第{slide['number']}页多个字段使用同一区域，生成时重新识别", slide=slide["number"]))
+    return missing, warnings
 
 
 def page_plan(model):
     slides = model["template"]["slides"]
     plan = []
+    deck_area = model["template"].get("width", 0) * model["template"].get("height", 0)
+
+    if not slides:
+        raise ValueError("模板没有可用页面")
 
     def add(role, **data):
-        candidates = [s for s in slides if s["role"] == role and not s.get("hidden")]
-        if not candidates and role in ROLE_LABELS:
-            candidates = [s for s in slides if s["role"] in ROLE_LABELS and not s.get("hidden")]
-        if not candidates:
-            raise ValueError(f"模板缺少{ROLES[role]}页面，请在模板设置中指定对应页面")
-        chosen = candidates[0]
-        required = ["bio", "identity", "photo"] if role in ROLE_LABELS else (["people", "title"] if role in ("opening", "talk", "discussion", "summary") else (["title"] if role == "cover" else []))
-        for field in required:
-            if not chosen["fields"].get(field):
-                raise ValueError(f"模板第{chosen['number']}页缺少{field}区域映射")
-        plan.append({"role": role, "template_slide": chosen["number"], **data})
+        required = (["bio", "identity", "photo"] if role in PERSON_ROLES else
+                    ["people", "title"] if role in EVENT_ROLES else
+                    ["title"] if role == "cover" else [])
+        visible = [slide for slide in slides if not slide.get("hidden")] or slides
+        ranked = []
+        for slide in visible:
+            enriched = {**slide, "deck_area": deck_area, "deck_height": model["template"].get("height", 0)}
+            fields = infer_slide_fields(enriched, role, existing=slide.get("fields"))
+            complete = sum(bool(fields.get(field)) for field in required)
+            same_group = ((role in PERSON_ROLES and slide["role"] in PERSON_ROLES)
+                          or (role in EVENT_ROLES and slide["role"] in EVENT_ROLES))
+            score = complete * 35 + (60 if slide["role"] == role else 0) + (25 if same_group else 0)
+            if role == "cover":
+                score += max(0, 20 - slide["number"])
+            elif role == "ending":
+                score += slide["number"]
+            ranked.append((score, slide, fields))
+        _, chosen, fields = max(ranked, key=lambda item: item[0])
+        missing_fields = [field for field in required if not fields.get(field)]
+        plan.append({"role": role, "template_slide": chosen["number"], "fields": fields,
+                     "template_fallback": chosen["role"] != role, "missing_fields": missing_fields, **data})
 
     add("cover")
     last_hosts = None
     for event in model["agenda"]["events"]:
-        role = event["kind"]
+        role = event["kind"] if event.get("kind") in EVENT_ROLES else "talk"
         if role in ("talk", "discussion") and event.get("hosts") and event["hosts"] != last_hosts:
-            for name in event["hosts"]:
+            for name in (name for name in event["hosts"] if name):
                 add("host", expert=name, time=event["time"])
             last_hosts = event["hosts"][:]
-        add(role, people=event["people"], title=event["title"], time=event["time"])
+        add(role, people=[name for name in event.get("people", []) if name],
+            title=event.get("title", ""), time=event.get("time", ""))
         if role == "opening" or (role == "summary" and model["options"].get("repeat_chairs")):
-            for name in event["people"]:
+            for name in (name for name in event.get("people", []) if name):
                 add("chair", expert=name, time=event["time"])
         elif role == "talk":
-            for name in event["people"]:
+            for name in (name for name in event.get("people", []) if name):
                 add("speaker", expert=name, time=event["time"])
         elif role == "discussion":
             if model["options"].get("include_topics"):
                 for s in slides:
                     if s["role"] == "topics" and not s.get("hidden"):
                         plan.append({"role": "topics", "template_slide": s["number"], "time": event["time"]})
-            for name in event["people"]:
+            for name in (name for name in event.get("people", []) if name):
                 add("guest", expert=name, time=event["time"])
     add("ending")
     return plan
 
 
 def portrait_bytes(expert, ratio):
-    package = read_package(expert["path"])
-    data = package[expert["photo"]]
+    if expert["photo"].startswith("file:"):
+        # 旧版WPS头像已在分析阶段安全提取为本地PNG。
+        data = Path(expert["photo"][5:]).read_bytes()
+    else:
+        package = read_package(expert["path"])
+        data = package[expert["photo"]]
     with Image.open(io.BytesIO(data)) as photo:
         photo = ImageOps.exif_transpose(photo).convert("RGB")
         target_h = min(1800, max(600, photo.height))
         target_w = max(1, round(target_h * ratio))
-        # 等比放大并裁切到图片框尺寸，人物略微上移，避免顶部留白并尽量保留头部。
+        source_ratio = photo.width / max(photo.height, 1)
+        # 窄幅全身照填入较宽照片框时从顶部开始裁切，优先保留完整头部和肩部。
+        # 普通证件照继续轻微上移，避免顶部留白并保持原有构图。
+        vertical_center = 0.0 if ratio > source_ratio * 1.35 else 0.4
         fitted = ImageOps.fit(photo, (target_w, target_h), method=Image.Resampling.LANCZOS,
-                              centering=(0.5, 0.4))
+                              centering=(0.5, vertical_center))
         output = io.BytesIO()
         fitted.save(output, "PNG", optimize=False)
         return output.getvalue()
@@ -408,15 +454,15 @@ def prune_package(package):
 
 def generate(model, destination):
     started = time.perf_counter()
-    missing = validate_model(model)
+    missing, validation_messages = validate_model(model)
     plan = page_plan(model)
     package = read_package(model["template"]["path"])
     profile = {s["number"]: s for s in model["template"]["slides"]}
-    experts = {e["name"]: e for e in model["experts"]}
+    experts = {e["name"]: e for e in model["experts"] if e.get("name")}
     agenda = model["agenda"]
-    messages, output_plan, cache, summaries = [], [], {}, {}
+    messages, output_plan, cache, summaries = list(validation_messages), [], {}, {}
     if missing:
-        messages.append(issue("draft_missing", "待核对版本，缺少简介：" + "、".join(missing), "error"))
+        messages.append(issue("draft_missing", "待核对版本，缺少简介：" + "、".join(missing)))
     if any(s["role"] == "topics" for s in profile.values()):
         messages.append(issue("topics", "讨论话题按原文保留，尚未校验其医学内容" if model["options"].get("include_topics") else "已按设置排除模板中的讨论话题页"))
     pres = xml(package["ppt/presentation.xml"])
@@ -436,27 +482,44 @@ def generate(model, destination):
         ET.SubElement(ct, tag("ct", "Default"), Extension="png", ContentType="image/png")
 
     def expert_data(name):
-        fallback = {"name": name, "hospital": "", "bio": ["简介待补充"], "photo": ""}
+        fallback = {"name": name, "hospital": "", "bio": ["简介待补充"], "photo": "", "photos": []}
         result = dict(experts.get(name, fallback))
-        details = agenda["people"].get(name, {})
-        result["display_hospital"] = details.get("hospital") or result["hospital"]
+        details = agenda.get("people", {}).get(name, {})
+        result["display_hospital"] = details.get("hospital") or result.get("hospital", "")
         result["display_title"] = details.get("display_title", "")
+        if result.get("photo") and result["photo"] not in [photo.get("image") for photo in result.get("photos", [])]:
+            result["photo"] = ""
         return result
 
+    # 同一模板页可能被多次复用，兼容提示按布局去重，避免核对报告重复刷屏。
+    fallback_notices = set()
+    missing_field_notices = set()
     for item in plan:
         source = profile[item["template_slide"]]
         original = xml(package[source["part"]])
-        fields = source["fields"]
+        fields = item.get("fields", source["fields"])
         role = item["role"]
         bio_pages = [None]
         person = expert_data(item["expert"]) if item.get("expert") else None
-        if person:
+        fallback_notice = (role, source["number"])
+        if item.get("template_fallback") and fallback_notice not in fallback_notices:
+            fallback_notices.add(fallback_notice)
+            messages.append(issue("template_fallback", f"{ROLES[role]}使用模板第{source['number']}页的相近布局", page=source["number"]))
+        missing_field_notice = (source["number"], tuple(item.get("missing_fields", ())))
+        if item.get("missing_fields") and missing_field_notice not in missing_field_notices:
+            missing_field_notices.add(missing_field_notice)
+            messages.append(issue("template_fields_missing", f"模板第{source['number']}页缺少可填充区域：{'、'.join(item['missing_fields'])}，该部分保留空白或原布局",
+                                  page=source["number"]))
+        summary = None
+        if person and fields.get("bio"):
             node = find_shape(original, fields["bio"])
             summary = select_single_page_bio(
                 node, shape_info(source, fields['bio']), person,
                 font_size=model["options"].get("bio_font_size", 16))
             bio_pages = [summary['lines']]
             summaries.setdefault(person['name'], []).append(summary)
+            if summary.get("fit_adjusted"):
+                messages.append(issue("bio_fit", f"{person['name']}的简介已按模板空间自动缩放或精简", expert=person["name"]))
             if summary['missing'] and not any(m.get('expert') == person['name'] and m['code'] == 'bio_missing_fields' for m in messages):
                 messages.append(issue('bio_missing_fields', person['name'] + '原文未明确：' + '、'.join(summary['missing']), expert=person['name']))
         for continuation, body_lines in enumerate(bio_pages):
@@ -468,43 +531,61 @@ def generate(model, destination):
                 if relation.get("Type", "").endswith(("/notesSlide", "/comments", "/slide")):
                     rels.remove(relation)
             clear_links(root)
-            for sid in fields.get("meeting", []):
-                node = find_shape(root, sid)
-                overflow, _ = fit_lines(node, shape_info(source, sid), [agenda["title"]], minimum=16)
-                if overflow:
-                    messages.append(issue("text_fit", f"第{len(output_plan)+1}页会议标题可能溢出"))
+            if role != "ending":
+                for sid in fields.get("meeting", []):
+                    node = find_shape(root, sid)
+                    overflow, _ = fit_lines(node, shape_info(source, sid), [agenda.get("title", "")], minimum=16)
+                    if overflow:
+                        messages.append(issue("text_fit", f"第{len(output_plan)+1}页会议标题可能溢出"))
             if role == "cover":
-                sid = fields["title"]
-                fit_lines(find_shape(root, sid), shape_info(source, sid), [agenda["title"]], minimum=24)
+                if fields.get("title"):
+                    sid = fields["title"]
+                    fit_lines(find_shape(root, sid), shape_info(source, sid), [agenda.get("title", "")], minimum=24)
                 for sid in fields.get("metadata", []):
                     node = find_shape(root, sid)
                     lines = paragraphs(node)
                     new_lines = []
                     for line in lines:
                         if DATE.search(line):
-                            line = DATE.sub(agenda["date"], line)
+                            line = DATE.sub(agenda.get("date", ""), line)
                         if "主办单位" in line:
                             line = "主办单位：" + agenda["organizer"] if agenda.get("organizer") else ""
                         if line:
                             new_lines.append(line)
                     set_text(node, new_lines)
+            elif role == "ending":
+                for sid in fields.get("ending_content", []):
+                    node = find_shape(root, sid)
+                    if node is None:
+                        continue
+                    new_lines = []
+                    title_written = False
+                    for line in paragraphs(node):
+                        if DATE.search(line):
+                            if agenda.get("date"):
+                                new_lines.append(DATE.sub(agenda["date"], line))
+                        elif agenda.get("title") and not title_written:
+                            new_lines.append(agenda["title"])
+                            title_written = True
+                    set_text(node, new_lines)
             elif person:
                 title = person["name"] + ("  " + person["display_title"] if person["display_title"] else "")
-                identity = find_shape(root, fields["identity"])
                 identity_lines = [title]
                 if fields.get("hospital"):
                     fit_lines(find_shape(root, fields["hospital"]), shape_info(source, fields["hospital"]), [person["display_hospital"]], minimum=14)
                 else:
                     identity_lines.append(person["display_hospital"])
-                set_text(identity, identity_lines)
-                body = find_shape(root, fields["bio"])
-                set_text(body, body_lines, font=summary['font'], line_spacing=summary['line_spacing'])
+                if fields.get("identity"):
+                    set_text(find_shape(root, fields["identity"]), identity_lines)
+                if fields.get("bio") and summary:
+                    body = find_shape(root, fields["bio"])
+                    set_text(body, body_lines, font=summary['font'], line_spacing=summary['line_spacing'])
                 if fields.get("role"):
                     role_node = find_shape(root, fields["role"])
                     label = ROLE_LABELS[role]
                     fit_lines(role_node, shape_info(source, fields["role"]), [label], minimum=10)
-                photo_node = find_shape(root, fields["photo"])
-                if person.get("photo"):
+                photo_node = find_shape(root, fields["photo"]) if fields.get("photo") else None
+                if person.get("photo") and photo_node is not None:
                     photo_shape = shape_info(source, fields["photo"])
                     frame_shape = photo_frame_shape(source, photo_shape)
                     replacement_shape = photo_shape
@@ -516,16 +597,18 @@ def generate(model, destination):
                     if fields.get("role"):
                         # 图片充满框后，将角色标签置于照片上层，避免标签被照片遮挡。
                         bring_to_front(find_shape(root, fields["role"]))
-                else:
+                elif photo_node is not None:
                     photo_node.getparent().remove(photo_node)
                     messages.append(issue("photo_missing", f"{person['name']}未填入照片，旧照片已清除"))
-            elif role in ("opening", "summary", "talk", "discussion"):
+            elif role in EVENT_ROLES:
                 lines = []
                 for name in item["people"]:
                     p = expert_data(name)
                     lines.append("  ".join(v for v in (name, p["display_title"], p["display_hospital"]) if v))
                 for field, values, minimum in [("people", lines, 18), ("title", [item["title"]], 24)]:
-                    sid = fields[field]
+                    sid = fields.get(field)
+                    if not sid:
+                        continue
                     overflow, _ = fit_lines(find_shape(root, sid), shape_info(source, sid), values, minimum)
                     if overflow:
                         messages.append(issue("text_fit", f"第{len(output_plan)+1}页{field}区域可能溢出，请检查预览"))
@@ -570,23 +653,25 @@ def generate(model, destination):
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
             for name, data in package.items():
                 archive.writestr(name, data)
-        # 再读取实际输出，确认页面顺序和专家文字确实写入文件。
+        # 再读取实际输出，结构错误仍会中断，内容缺项记录到报告并继续交付。
         checked = read_deck(temporary)
         if len(checked["slides"]) != len(output_plan):
             raise ValueError("生成后的页面数量不一致")
+        content_warnings = []
         for page, spec in zip(checked["slides"], output_plan):
             if spec.get("expert") and compact(spec["expert"]) not in compact(page["text"]):
-                raise ValueError(f"第{spec['page']}页缺少对应专家姓名")
+                content_warnings.append(f"第{spec['page']}页缺少对应专家姓名")
             for name in spec.get('people', []):
                 if compact(name) not in compact(page['text']):
-                    raise ValueError(f"第{spec['page']}页名单缺少{name}")
-            if spec.get('role') == 'talk' and compact(spec['title']) not in compact(page['text']):
-                raise ValueError(f"第{spec['page']}页讲题写入不完整")
+                    content_warnings.append(f"第{spec['page']}页名单缺少{name}")
+            if spec.get('role') == 'talk' and spec.get('title') and compact(spec['title']) not in compact(page['text']):
+                content_warnings.append(f"第{spec['page']}页讲题写入不完整")
             # 校验本次精选内容，完整原文保留在核对报告中供追溯。
             for line in spec.get('selected_bio') or []:
                 if compact(line) not in compact(page['text']):
-                    raise ValueError(f"{spec['expert']}的精选简介未完整写入")
-        current_names = {name for event in agenda['events'] for name in event['people'] + event['hosts']}
+                    content_warnings.append(f"{spec['expert']}的精选简介未完整写入")
+        current_names = {name for event in agenda.get('events', [])
+                         for name in event.get('people', []) + event.get('hosts', []) if name}
         old_names = set()
         for source in profile.values():
             identity_ids = {source['fields'].get('identity'), source['fields'].get('people')}
@@ -598,14 +683,18 @@ def generate(model, destination):
                 continue
             for name in old_names:
                 if name in compact(page['text']):
-                    raise ValueError(f"第{spec['page']}页仍有模板旧人物{name}，请检查区域映射")
+                    content_warnings.append(f"第{spec['page']}页仍有模板旧人物{name}，请检查区域映射")
+        for message in dict.fromkeys(content_warnings):
+            messages.append(issue("output_content", message))
         os.replace(temporary, target)
     finally:
         if temporary.exists():
             temporary.unlink()
     report = {"file": target.name, "pages": output_plan, "issues": messages, "input_issues": model["issues"],
               "bio_summaries": summaries,
-              "draft": bool(missing or model["options"].get("draft")), "validation": {"structure": "passed", "content": "passed", "visual": "not_rendered"},
+              "draft": bool(missing or model["options"].get("draft") or validation_messages),
+              "validation": {"structure": "passed", "content": "warnings" if any(m["code"] == "output_content" for m in messages) else "passed",
+                             "visual": "not_rendered"},
               "metrics": {**model["metrics"], "generation_seconds": round(time.perf_counter() - started, 3), "ai_calls": 0}}
     target.with_suffix(".report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report

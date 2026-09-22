@@ -14,6 +14,8 @@ SOCIETY = re.compile(r'协会|学会|分会|委员会|专委会|专委|学组|�
 SOCIAL_ROLE = re.compile(r'委员|常委|主委|理事|会长|组长|秘书|编委|常务|顾问')
 DEPARTMENT = re.compile(r'科|病区|病房|院区|中心|EICU|ICU|院长|院士|MDT', re.I)
 HEADINGS = {'学术兼职', '学术任职', '社会兼职', '专业特长', '课题', '科研项目', '研究方向', '获奖', '荣誉'}
+MEETING_ROLE_PREFIX = re.compile(r'^(?:(?:大会|会议|环节)?(?:讨论嘉宾|讨论专家|讲者|主持人?|主席|讨论))(?:[:：]\s*)?')
+MEETING_TOPIC_PREFIX = re.compile(r'^(?:(?:大会|会议|环节)?(?:讲者|主持人?|主席|讨论))主题[:：]?')
 
 
 def clean(value):
@@ -39,6 +41,19 @@ def social_score(value):
     return scope + rank
 
 
+def other_score(value):
+    """个人介绍优先专业方向和擅长内容，其次保留成果与重要履历。"""
+    if re.search(r'擅长|研究方向|专业特长|长期从事|从事|临床|临证|熟练|专注|致力', value):
+        return 400
+    if re.search(r'获奖|荣获|人才|荣誉|称号|成就奖', value):
+        return 300
+    if re.search(r'发表|科研|课题|基金|著作|出版|参研', value, re.I):
+        return 200
+    if re.search(r'主任|书记|院长', value):
+        return 100
+    return 0
+
+
 def split_other_line(value):
     """从长段原文中提取完整短句，著作信息按书名保留可核对的角色。"""
     books = re.findall(r'《[^》]+》', value)
@@ -52,6 +67,7 @@ def split_other_line(value):
             else:
                 result.append('参与' + book + '著作编写')
         return result
+    # 普通个人介绍保留逗号和顿号，只按完整句子或分号拆分。
     parts = [clean(part) for part in re.split(r'[。；;]+', value) if clean(part)]
     result = []
     for part in parts:
@@ -67,14 +83,33 @@ def split_other_line(value):
     return result
 
 
+def bio_source_line(value, name):
+    """清除会议角色标签，保留同一行中真实的个人简介内容。"""
+    value = clean(value)
+    if MEETING_TOPIC_PREFIX.match(value):
+        return ''
+    match = MEETING_ROLE_PREFIX.match(value)
+    if match:
+        value = clean(value[match.end():])
+        if name:
+            value = clean(re.sub(r'^' + re.escape(name), '', value))
+    return value
+
+
+def split_social_line(value):
+    """按资料中的并列标点拆开社会任职，避免整段任职占用一行。"""
+    parts = [clean(part) for part in re.split(r'[，,、；;。]+', value) if clean(part)]
+    return parts or [clean(value)]
+
+
 def summarize_bio(expert):
-    """整理固定八行简介，先放临床信息，再用学校履历和其他原文补足。"""
-    source = [clean(x) for x in expert.get('bio', []) if clean(x)]
+    """整理最多八条简介，优先临床信息、学校履历和重要社会任职。"""
+    source = [line for value in expert.get('bio', [])
+              for line in [bio_source_line(value, expert.get('name', ''))] if line]
     if source == ['简介待补充']:
-        lines = ['简介待补充', '医院及科室信息待补充', '临床职务职称待补充', '学历信息待补充',
-                 '导师信息待补充', '社会任职待补充', '专业方向待补充', '科研成果待补充']
+        lines = ['简介待补充']
         return {'lines': lines, 'clinical': '', 'academic': '', 'social': [], 'other': [],
-                'placeholders': lines[1:], 'source': source, 'missing': ['简介']}
+                'placeholders': [], 'source': source, 'missing': ['简介']}
     # 修复文本框里人为拆开的委员会名称，避免输出半条任职。
     joined = []
     for line in source:
@@ -83,71 +118,82 @@ def summarize_bio(expert):
         else:
             joined.append(line)
     hospital = expert.get('hospital') or expert.get('display_hospital', '')
-    # 协会名称中的研究型医院不能当作工作医院。
-    if SOCIETY.search(hospital) or not any(hospital and x.startswith(hospital) and not SOCIETY.search(x) for x in joined):
+    # 医院名称紧接协会或学会时属于组织名称，不能当作专家工作医院。
+    workplace = bool(hospital and any(re.search(re.escape(hospital) + r'(?!协会|学会|分会|委员会)', line)
+                                      for line in joined))
+    if SOCIETY.search(hospital) or not workplace:
         hospital = expert.get('display_hospital', '')
+    # 先按句号和分号分段，避免同一文本框中的医院职称被后续学术任职干扰。
+    units = [part for line in joined for part in split_other_line(line)]
     clinical, titles, academic, social, other = [], [], [], [], []
-    for line in joined:
+    for line in units:
         if clean(line).rstrip(':：') in HEADINGS:
             continue
+        pending = [line]
         if SOCIETY.search(line) or re.search(r'委员|常委|主委', line):
-            if SOCIAL_ROLE.search(line) and not re.search(r'^师从|发表|主持.*基金|擅长', line):
-                social.append(line)
-            continue
-        if re.search(r'^(主要|从事|擅长|发表|主持|承担|专业特长|学术兼职|学术任职|社会兼职|科研|师从|齐鲁人才|济南市劳动)|著作|编写|出版', line):
-            if not re.search(r'^(学术兼职|学术任职|社会兼职|专业特长)[:：]?$', line):
-                # 长段落按原有句号拆分，保证每一行仍是完整原文。
-                other.extend(split_other_line(line))
-            continue
-        if re.search(r'大学|学院', line) and re.search(r'研究所|实验室|访问学者', line):
-            academic.append(line)
-            continue
-        # 学术头衔可能紧贴临床职称，例如主任医师博士生导师。
-        titles.extend(CLINICAL.findall(line))
-        rest = clean(CLINICAL.sub('', line).replace('中共党员', ''))
-        if not rest:
-            continue
-        pieces = [clean(p) for p in re.split(r'[，,、；;]+', rest) if clean(p)]
-        for piece in pieces:
-            match = ACADEMIC.search(piece)
-            if match:
-                tail = clean(piece[match.end():])
-                if match.start() == 0 and tail and DEPARTMENT.search(tail) and not ACADEMIC.search(tail):
-                    academic.append(match.group())
-                    clinical.append(tail)
-                    continue
-                prefix = clean(piece[:match.start()])
-                # 同一行兼有医院科室和导师头衔时，在头衔起点分开。
-                if prefix and ('医院' in prefix or DEPARTMENT.search(prefix)) and not re.search(r'大学|学院', prefix.replace(hospital, '')):
-                    clinical.append(prefix)
-                    academic.append(piece[match.start():])
-                else:
-                    academic.append(piece)
-            elif hospital and piece == hospital:
+            # 同一段中的多项任职按逗号、顿号和分号拆开，每项占一行参与排序。
+            pending = []
+            for part in split_social_line(line):
+                if SOCIAL_ROLE.search(part) and not re.search(r'^师从|发表|主持.*基金|擅长', part):
+                    social.append(part)
+                elif part:
+                    pending.append(part)
+        for item in pending:
+            if re.search(r'^(主要|长期从事|从事|擅长|熟练|研究方向|专注|致力|对|临床|临证|发表|主持|承担|参研|专业特长|学术兼职|学术任职|社会兼职|科研|师从|齐鲁人才|济南市劳动)|^在.*(?:发表|完成|出版)|^曾.*(?:荣获|获奖)|著作|编写|出版', item):
+                if not re.search(r'^(学术兼职|学术任职|社会兼职|专业特长)[:：]?$', item):
+                    other.append(item)
                 continue
-            elif '医院' in piece or DEPARTMENT.search(piece):
-                # 医院MDT专长与职务保留在原文中，首行优先主要科室。
-                if not re.search(r'MDT|协作|专家', piece):
-                    clinical.append(piece)
-            else:
-                other.append(piece)
+            if re.search(r'大学|学院', item) and re.search(r'研究所|实验室|访问学者', item):
+                academic.append(item)
+                continue
+            # 临床职称和教授职称并入首行，学历及导师信息单独成行。
+            titles.extend(CLINICAL.findall(item))
+            titles.extend(re.findall(r'副教授|(?<!副)教授', item))
+            rest = clean(CLINICAL.sub('', item).replace('中共党员', ''))
+            rest = clean(re.sub(r'副教授|(?<!副)教授', '', rest))
+            if not rest:
+                continue
+            pieces = [clean(part) for part in re.split(r'[，,、]+', rest) if clean(part)]
+            for piece in pieces:
+                match = ACADEMIC.search(piece)
+                if match:
+                    tail = clean(piece[match.end():])
+                    if match.start() == 0 and tail and DEPARTMENT.search(tail) and not ACADEMIC.search(tail):
+                        academic.append(match.group())
+                        clinical.append(tail)
+                        continue
+                    prefix = clean(piece[:match.start()])
+                    # 同一行兼有医院科室和导师头衔时，在头衔起点分开。
+                    if prefix and ('医院' in prefix or DEPARTMENT.search(prefix)) and not re.search(r'大学|学院', prefix.replace(hospital, '')):
+                        clinical.append(prefix)
+                        academic.append(piece[match.start():])
+                    else:
+                        academic.append(piece)
+                elif hospital and piece == hospital:
+                    continue
+                elif '医院' in piece or DEPARTMENT.search(piece):
+                    # 医院MDT专长与职务保留在原文中，首行优先主要科室。
+                    if not re.search(r'MDT|协作|专家', piece):
+                        clinical.append(piece)
+                else:
+                    other.append(piece)
     clinical = unique(clinical)
     primary = next((x for x in clinical if hospital and x.startswith(hospital) and x != hospital), '')
     departments = [x for x in clinical if x != primary and '医院' not in x]
     first = primary or hospital
-    if departments:
+    if departments and not primary:
         department = departments[0]
-        if department not in first:
+        if department not in first and not re.match(r'^(任|历任|曾任|牵头|组建)', department):
             first += department
-    for title in unique(titles)[:1]:
+    for title in unique(titles):
         if title not in first:
-            first += ('，' if first else '') + title
+            first += (('，' if not any(existing in first for existing in unique(titles)) else '、') if first else '') + title
     # 学历与导师优先于其他学校任职，保留限定词及学校名称，不推断导师层级。
     academic = unique(academic)
     academic.sort(key=lambda x: (0 if re.search(r'导师|硕导|博导|生导', x) else 1 if re.search(r'博士|硕士', x) else 2))
     second = '，'.join(academic[:2])
     social = sorted(unique(social), key=lambda x: -social_score(x))
-    other = unique(other)
+    other = sorted(unique(other), key=lambda value: -other_score(value))
     missing = []
     if not first:
         missing.append('医院及临床职务')
@@ -157,34 +203,14 @@ def summarize_bio(expert):
         missing.append('科室')
     if not titles and not any(re.search(r'主任|院长|医师', x) for x in clinical):
         missing.append('临床职务职称')
-    # 没有学校履历时直接承接社会任职，不保留空行。其余原文用于补足八行。
-    lines = [first] + ([second] if second else [])
+    # 没有学校履历时直接承接社会任职，其余原文用于补足，资料不足时不显示占位文字。
+    lines = ([first] if first else []) + ([second] if second else [])
     for value in social + other:
         if value and compact(value) not in {compact(x) for x in lines}:
             lines.append(value)
         if len(lines) == 8:
             break
-    # 原资料不足八条时用明确的缺项说明补齐，避免编造或重复履历。
-    text = '\n'.join(source)
-    placeholders = []
-    categories = [
-        ('学历或学校履历资料未提供', not second),
-        ('临床职务职称资料未提供', not titles and not re.search(r'主任|院长|医师', first)),
-        ('科室信息资料未提供', not any(DEPARTMENT.search(x.replace(hospital, '')) for x in clinical)),
-        ('其他重要任职资料未提供', len(social) < 7),
-        ('专业方向资料未提供', not re.search(r'主要|从事|擅长|专业特长', text)),
-        ('科研成果资料未提供', not re.search(r'发表|主持|基金|课题|科研|SCI|著作|编写|出版', text, re.I)),
-        ('获奖或荣誉资料未提供', not re.search(r'获奖|人才|荣誉|称号', text)),
-    ]
-    for value, absent in categories:
-        if absent and len(lines) < 8:
-            lines.append(value)
-            placeholders.append(value)
-    while len(lines) < 8:
-        value = f'其他履历资料待补充{len(lines) + 1}'
-        lines.append(value)
-        placeholders.append(value)
     selected_social = [x for x in lines if x in social]
     return {'lines': lines[:8], 'clinical': first, 'academic': second, 'social': social, 'other': other,
-            'selected_social': selected_social, 'placeholders': placeholders,
+            'selected_social': selected_social, 'placeholders': [],
             'source': list(expert.get('bio', [])), 'missing': missing}

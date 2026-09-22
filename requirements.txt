@@ -1,2 +1,7 @@
 lxml>=5.0,<7
 Pillow>=10.0,<13
+numpy>=1.26,<2
+opencv-python>=4.8,<4.11
+onnxruntime>=1.23,<2
+rapidocr>=3.9,<4
+olefile>=0.47,<1

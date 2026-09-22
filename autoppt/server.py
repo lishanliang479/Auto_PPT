@@ -1,10 +1,13 @@
-"""仅监听本机的网页工具，任务文件保存在项目work目录。"""
+"""仅监听本机的网页工具，任务文件保存在用户数据目录。"""
 
 from __future__ import annotations
 
 import copy
 import json
+import os
+import re
 import secrets
+import sys
 import threading
 import traceback
 import urllib.parse
@@ -13,22 +16,54 @@ from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .analyze import ROLES, analyze, discover
+from .analyze import ROLES, TIME, analyze, discover
 from .generate import generate, page_plan
 from .ooxml import MAX_FILE, read_deck
+from .poster import analyze_poster, poster_preview, render_poster
 
-ROOT = Path(__file__).resolve().parent.parent
+SOURCE_ROOT = Path(__file__).resolve().parent.parent
+# 打包后静态网页位于PyInstaller资源目录，任务文件保存在用户可写目录。
+ASSET_ROOT = Path(getattr(sys, "_MEIPASS", SOURCE_ROOT))
+# 测试和运维可用环境变量指定数据目录，普通用户安装后自动使用本地应用数据目录。
+DATA_ROOT = Path(os.environ["AUTO_PPT_DATA_ROOT"]) if os.environ.get("AUTO_PPT_DATA_ROOT") else (
+    Path(os.environ.get("LOCALAPPDATA", Path.home())) / "AutoPPT"
+    if getattr(sys, "frozen", False) else SOURCE_ROOT)
 JOBS = {}
 LOCK = threading.Lock()
 TOKEN = secrets.token_urlsafe(32)
 MAX_UPLOAD = 400 * 1024 * 1024
 
 
-def new_job():
+def ppt_output_filename(model):
+    """使用会议名称和完整会议时间生成Windows可用的PPT文件名。"""
+    agenda = model.get("agenda", {})
+    title = str(agenda.get("title", "")).strip() or "会议"
+    events = agenda.get("events", [])
+    matches = [TIME.search(str(event.get("time", ""))) for event in events]
+    matches = [match for match in matches if match]
+    period = ""
+    if matches:
+        start, end = matches[0][1], matches[-1][2]
+
+        def clock(value):
+            hour, minute = re.split(r"[:：]", value)
+            return f"{int(hour)}时{minute}分"
+
+        period = clock(start) + "至" + clock(end)
+    meeting_time = str(agenda.get("date", "")).strip() + period
+    stem = title + meeting_time
+    # 删除Windows文件名禁用字符并限制长度，避免下载后无法保存。
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", stem)
+    stem = re.sub(r"\s+", "", stem).strip(". ")[:180] or "会议串场"
+    return stem + ".pptx"
+
+
+def new_job(kind="ppt"):
     identifier = secrets.token_hex(12)
-    directory = ROOT / "work" / identifier
+    directory = DATA_ROOT / "work" / identifier
     directory.mkdir(parents=True)
-    job = {"id": identifier, "status": "analyzing", "message": "正在读取资料和分析模板", "directory": directory}
+    job = {"id": identifier, "kind": kind, "status": "analyzing",
+           "message": "正在读取资料和分析模板", "directory": directory}
     with LOCK:
         JOBS[identifier] = job
     return job
@@ -36,11 +71,25 @@ def new_job():
 
 def analyze_job(job, template, agenda, experts):
     try:
-        model = analyze(template, agenda, experts, job["directory"], ROOT / 'work/template_profiles')
+        model = analyze(template, agenda, experts, job["directory"], DATA_ROOT / 'work/template_profiles')
         job["model"] = model
         job["status"] = "ready"
         job["message"] = "识别完成，可核对并生成"
         (job["directory"] / "analysis.json").write_text(json.dumps(model, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        job.update(status="failed", message=str(exc))
+        traceback.print_exc()
+
+
+def analyze_poster_job(job, template, agenda, experts):
+    try:
+        job["message"] = "正在进行本地OCR并匹配专家头像"
+        model = analyze_poster(template, agenda, experts, job["directory"])
+        job["model"] = model
+        job["status"] = "ready"
+        job["message"] = "海报资料识别完成，可核对并生成"
+        (job["directory"] / "poster-analysis.json").write_text(
+            json.dumps(model, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as exc:
         job.update(status="failed", message=str(exc))
         traceback.print_exc()
@@ -110,11 +159,58 @@ def apply_edits(original, incoming):
     return model
 
 
+def apply_poster_edits(original, incoming):
+    """海报编辑仅更新文字、角色和日程，文件路径继续使用服务端记录。"""
+    model = copy.deepcopy(original)
+    if not isinstance(incoming, dict):
+        raise ValueError("提交内容格式不正确")
+    agenda = incoming.get("agenda", {})
+    for key in ("title", "date", "meeting_time", "meeting_code", "venue", "organizer"):
+        if key in agenda:
+            model["agenda"][key] = str(agenda[key])[:2000]
+    if "chairs" in agenda:
+        if not isinstance(agenda["chairs"], list):
+            raise ValueError("会议主席格式不正确")
+        model["agenda"]["chairs"] = [str(name)[:60] for name in agenda["chairs"] if str(name).strip()]
+    if "events" in agenda:
+        if not isinstance(agenda["events"], list) or len(agenda["events"]) > 100:
+            raise ValueError("日程数量超出限制")
+        events = []
+        for event in agenda["events"]:
+            if not all(isinstance(event.get(key), str) for key in ("time", "kind", "title")):
+                raise ValueError("日程字段格式不正确")
+            for key in ("people", "hosts"):
+                if not isinstance(event.get(key), list):
+                    raise ValueError("日程人员格式不正确")
+            events.append({"time": event["time"][:60], "kind": event["kind"][:30],
+                           "title": event["title"][:1000],
+                           "people": [str(name)[:60] for name in event["people"]],
+                           "hosts": [str(name)[:60] for name in event["hosts"]]})
+        model["agenda"]["events"] = events
+    updates = incoming.get("experts", [])
+    if len(updates) != len(model["experts"]):
+        raise ValueError("专家数量发生变化，请重新上传资料")
+    allowed_roles = {"chair", "host", "speaker", "guest"}
+    for expert, update in zip(model["experts"], updates):
+        old_name = expert["name"]
+        for key in ("name", "hospital", "display_title"):
+            if key in update:
+                expert[key] = str(update[key])[:500]
+        if update.get("role") in allowed_roles:
+            expert["role"] = update["role"]
+        if old_name != expert["name"]:
+            model["agenda"]["chairs"] = [expert["name"] if name == old_name else name for name in model["agenda"]["chairs"]]
+            for event in model["agenda"]["events"]:
+                for key in ("people", "hosts"):
+                    event[key] = [expert["name"] if name == old_name else name for name in event[key]]
+    return model
+
+
 def generate_job(job, model):
     try:
-        filename = "待核对会议串场.pptx" if model["options"]["draft"] else "会议串场.pptx"
+        filename = ppt_output_filename(model)
         report = generate(model, job["directory"] / filename)
-        cache = ROOT / 'work/template_profiles'
+        cache = DATA_ROOT / 'work/template_profiles'
         cache.mkdir(parents=True, exist_ok=True)
         (cache / (model['template']['fingerprint'] + '.json')).write_text(
             json.dumps([{'role': s['role'], 'fields': s['fields']} for s in model['template']['slides']], ensure_ascii=False), encoding='utf-8')
@@ -123,6 +219,21 @@ def generate_job(job, model):
         job["result"] = filename
         job["output_slides"] = read_deck(job["directory"] / filename)
         job.update(status="complete", message="PPT已生成，结构与人员内容校验通过")
+    except Exception as exc:
+        job.update(status="ready", message=str(exc), generation_error=str(exc))
+        traceback.print_exc()
+
+
+def generate_poster_job(job, model):
+    try:
+        filename = "会议海报.png"
+        report = render_poster(model, job["directory"] / filename)
+        job["model"] = model
+        job["report"] = report
+        job["result"] = filename
+        job["mime"] = "image/png"
+        job["preview"] = poster_preview(job["directory"] / filename)
+        job.update(status="complete", message="海报已生成，可预览并下载PNG")
     except Exception as exc:
         job.update(status="ready", message=str(exc), generation_error=str(exc))
         traceback.print_exc()
@@ -159,7 +270,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.response({"error": "仅允许本机访问"}, 403)
         path = urllib.parse.urlsplit(self.path).path
         if path == "/api/config":
-            samples = [n for n in ("input", "input1") if (ROOT / n).is_dir()]
+            samples = [n for n in ("input", "input1") if (ASSET_ROOT / n).is_dir()]
             return self.response({"token": TOKEN, "roles": ROLES, "samples": samples})
         if path.startswith("/api/jobs/"):
             parts = path.strip("/").split("/")
@@ -167,11 +278,12 @@ class Handler(BaseHTTPRequestHandler):
             if not job:
                 return self.response({"error": "任务不存在或服务已重启"}, 404)
             if len(parts) == 3:
-                result = {k: v for k, v in job.items() if k in ("id", "status", "message", "model", "report", "generation_error", "output_slides")}
+                result = {k: v for k, v in job.items() if k in ("id", "kind", "status", "message", "model", "report", "generation_error", "output_slides", "preview")}
                 return self.response(result)
             if parts[3] == "download" and job.get("result"):
                 file = job["directory"] / job["result"]
-                return self.response(file.read_bytes(), mime="application/vnd.openxmlformats-officedocument.presentationml.presentation", filename=file.name)
+                mime = job.get("mime", "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+                return self.response(file.read_bytes(), mime=mime, filename=file.name)
             if parts[3] == "report" and job.get("report"):
                 return self.response(job["report"], filename="核对报告.json")
             return self.response({"error": "文件尚未生成"}, 404)
@@ -182,7 +294,7 @@ class Handler(BaseHTTPRequestHandler):
                   "/style.css": ("style.css", "text/css")}
         if path in static:
             filename, mime = static[path]
-            file = ROOT / "web" / filename
+            file = ASSET_ROOT / "web" / filename
             return self.response(file.read_bytes(), mime=mime + "; charset=utf-8")
         return self.response({"error": "未找到页面"}, 404)
 
@@ -202,7 +314,7 @@ class Handler(BaseHTTPRequestHandler):
                 sample = json.loads(body).get("name")
                 if sample not in ("input", "input1"):
                     raise ValueError("示例目录无效")
-                template, agenda, experts = discover(ROOT / sample)
+                template, agenda, experts = discover(ASSET_ROOT / sample)
                 job = new_job()
                 threading.Thread(target=analyze_job, args=(job, template, agenda, experts), daemon=True).start()
                 return self.response({"id": job["id"]}, 202)
@@ -219,7 +331,7 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     name = Path(name.replace("\\", "/")).name
                     ext = Path(name).suffix.lower()
-                    if ext not in ((".pptx",) if kind != "experts" else (".pptx", ".docx", ".zip")):
+                    if ext not in ((".pptx",) if kind != "experts" else (".pptx", ".docx", ".wps", ".zip")):
                         raise ValueError(f"不支持的文件：{name}")
                     data = part.get_payload(decode=True)
                     if len(data) > MAX_FILE:
@@ -232,6 +344,38 @@ class Handler(BaseHTTPRequestHandler):
                 if len(files["template"]) != 1 or len(files["agenda"]) != 1 or not files["experts"]:
                     raise ValueError("需要1份模板、1份日程和至少1份专家资料")
                 threading.Thread(target=analyze_job, args=(job, files["template"][0], files["agenda"][0], files["experts"]), daemon=True).start()
+                return self.response({"id": job["id"]}, 202)
+            if path == "/api/poster/analyze":
+                content_type = self.headers.get("Content-Type", "")
+                if "multipart/form-data" not in content_type:
+                    raise ValueError("请使用文件上传表单")
+                message = BytesParser(policy=policy.default).parsebytes(
+                    ("Content-Type: " + content_type + "\r\nMIME-Version: 1.0\r\n\r\n").encode() + body)
+                job = new_job("poster")
+                files = {"poster_template": [], "poster_agenda": [], "poster_experts": []}
+                allowed = {"poster_template": (".png", ".jpg", ".jpeg", ".webp"),
+                           "poster_agenda": (".png", ".jpg", ".jpeg", ".webp"),
+                           "poster_experts": (".zip", ".png", ".jpg", ".jpeg", ".webp")}
+                for index, part in enumerate(message.iter_parts()):
+                    kind, name = part.get_param("name", header="content-disposition"), part.get_filename()
+                    if kind not in files or not name:
+                        continue
+                    name = Path(name.replace("\\", "/")).name
+                    if Path(name).suffix.lower() not in allowed[kind]:
+                        raise ValueError(f"不支持的文件：{name}")
+                    data = part.get_payload(decode=True)
+                    if len(data) > MAX_FILE:
+                        raise ValueError("单个文件超过200MB")
+                    directory = job["directory"] / kind / str(index)
+                    directory.mkdir(parents=True)
+                    file = directory / name
+                    file.write_bytes(data)
+                    files[kind].append(file)
+                if len(files["poster_template"]) != 1 or len(files["poster_agenda"]) != 1 or not files["poster_experts"]:
+                    raise ValueError("需要1张海报模板、1张日程图片和至少1份头像图片或压缩包")
+                threading.Thread(target=analyze_poster_job,
+                                 args=(job, files["poster_template"][0], files["poster_agenda"][0], files["poster_experts"]),
+                                 daemon=True).start()
                 return self.response({"id": job["id"]}, 202)
             if path.startswith("/api/jobs/") and path.endswith("/generate"):
                 identifier = path.split("/")[3]
@@ -247,6 +391,21 @@ class Handler(BaseHTTPRequestHandler):
                     job.pop("generation_error", None)
                     job.update(status="generating", message="正在填充模板和校验PPT")
                 threading.Thread(target=generate_job, args=(job, model), daemon=True).start()
+                return self.response({"id": identifier}, 202)
+            if path.startswith("/api/jobs/") and path.endswith("/poster-generate"):
+                identifier = path.split("/")[3]
+                job = JOBS.get(identifier)
+                if not job or job.get("kind") != "poster" or "model" not in job:
+                    raise ValueError("海报任务未准备好")
+                with LOCK:
+                    if job["status"] == "generating":
+                        raise ValueError("该任务正在生成，请等待完成")
+                    model = apply_poster_edits(job["model"], json.loads(body))
+                    if not model["agenda"]["title"] or not model["agenda"]["events"]:
+                        raise ValueError("请补充会议名称和日程后再生成")
+                    job.pop("generation_error", None)
+                    job.update(status="generating", message="正在排版专家头像和会议日程")
+                threading.Thread(target=generate_poster_job, args=(job, model), daemon=True).start()
                 return self.response({"id": identifier}, 202)
             return self.response({"error": "未知操作"}, 404)
         except (ValueError, KeyError, TypeError) as exc:
