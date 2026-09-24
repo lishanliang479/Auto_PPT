@@ -16,18 +16,19 @@ from .ooxml import compact, read_deck, read_docx, read_package, read_wps, unpack
 TIME = re.compile(r"(\d{1,2}[:：]\d{2})\s*[-~至—–－]\s*(\d{1,2}[:：]\d{2})")
 # 同时识别中文日期和模板中常见的点号、斜杠、短横线日期。
 DATE = re.compile(r"(20\d{2})\s*(?:年\s*|[./-]\s*)(\d{1,2})\s*(?:月\s*|[./-]\s*)(\d{1,2})\s*日?")
-ROLES = {"cover": "封面", "opening": "主席致辞", "chair": "主席简介", "host": "主持简介",
+ROLES = {"cover": "封面", "agenda": "模板日程", "opening": "主席致辞", "chair": "主席简介", "host": "主持简介",
          "talk": "讲题", "speaker": "讲者简介", "discussion": "讨论名单", "guest": "嘉宾简介",
          "topics": "讨论话题", "summary": "会议总结", "ending": "结束页", "unknown": "待识别"}
 PERSON_ROLES = {"chair", "host", "speaker", "guest"}
 EVENT_ROLES = {"opening", "talk", "discussion", "summary"}
 ROLE_TEXTS = {
     "chair": ("大会主席", "会议主席", "学术主席"),
-    "host": ("大会主持", "会议主持", "环节主持", "主持人"),
-    "speaker": ("大会讲者", "会议讲者", "讲者简介", "主讲嘉宾"),
+    "host": ("大会主持", "会议主持", "环节主持", "主持人", "主持嘉宾"),
+    "speaker": ("大会讲者", "会议讲者", "讲者简介", "主讲嘉宾", "特邀讲者", "授课嘉宾", "授课专家"),
     "guest": ("讨论嘉宾", "讨论专家", "特邀嘉宾", "与会专家"),
 }
 ENDING_GENERIC = ("会议结束", "大会结束", "谢谢", "感谢", "身体健康", "二维码", "扫码", "签到")
+DISCUSSION_EVENT_MARKERS = ("讨论", "交流环节", "圆桌", "对话", "互动交流", "互动环节", "专家交流")
 OCR_LOCK = threading.Lock()
 OCR_ENGINE = None
 
@@ -96,9 +97,24 @@ def people_details(text, names):
     return result
 
 
-def image_title(path, deck):
+def geometry_order(shapes, deck_height):
+    """按视觉行从上到下、每行从左到右排列对象，并容忍同一行的轻微纵向偏差。"""
+    tolerance = max(1, deck_height * .08)
+    rows = []
+    for shape in sorted(shapes, key=lambda item: (item["bbox"][1], item["bbox"][0])):
+        y = shape["bbox"][1]
+        if not rows or abs(y - rows[-1][0]) > tolerance:
+            rows.append([y, [shape]])
+        else:
+            rows[-1][1].append(shape)
+            rows[-1][0] = sum(item["bbox"][1] for item in rows[-1][1]) / len(rows[-1][1])
+    return [shape for _, row in rows for shape in sorted(row, key=lambda item: item["bbox"][0])]
+
+
+def image_title(path, deck, warnings=None):
     """文字标题缺失时识别页面顶部横幅图片中的会议名称。"""
     global OCR_ENGINE
+    warnings = warnings if warnings is not None else []
     candidates = [shape for slide in deck["slides"] for shape in slide["shapes"]
                   if shape.get("image") and shape["bbox"][1] < deck["height"] * .35
                   and shape["bbox"][2] > deck["width"] * .4
@@ -108,29 +124,36 @@ def image_title(path, deck):
     try:
         from rapidocr import RapidOCR
     except ImportError:
+        # 服务环境缺少OCR依赖时给出明确提示，避免图片标题静默变成空值。
+        warnings.append(issue("agenda_title_ocr_unavailable", "日程顶部是图片，但当前运行环境缺少RapidOCR，会议名称暂时留空"))
         return ""
     package = read_package(path)
     lines = []
-    with OCR_LOCK:
-        if OCR_ENGINE is None:
-            OCR_ENGINE = RapidOCR()
-        for shape in sorted(candidates, key=lambda item: (item["bbox"][1], item["bbox"][0])):
-            data = package.get(shape["image"], b"")
-            if not data:
-                continue
-            result = OCR_ENGINE(data)
-            if result is None or result.txts is None:
-                continue
-            for value, score in zip(result.txts, result.scores):
-                value = normalized_text(value)
-                marker = compact(value).upper()
-                # 日程标签和页眉字段不属于会议名称，识别后直接过滤。
-                if float(score) < .65 or marker in {"会议日程", "大会日程", "日程", "AGENDA"}:
+    try:
+        with OCR_LOCK:
+            if OCR_ENGINE is None:
+                OCR_ENGINE = RapidOCR()
+            for shape in sorted(candidates, key=lambda item: (item["bbox"][1], item["bbox"][0])):
+                data = package.get(shape["image"], b"")
+                if not data:
                     continue
-                if re.search(r"会议(?:时间|地点|地址|主席)|主办单位|腾讯会议", value):
+                result = OCR_ENGINE(data)
+                if result is None or result.txts is None:
                     continue
-                if len(marker) >= 4:
-                    lines.append(value)
+                for value, score in zip(result.txts, result.scores):
+                    value = normalized_text(value)
+                    marker = compact(value).upper()
+                    # 日程标签和页眉字段不属于会议名称，识别后直接过滤。
+                    if float(score) < .65 or marker in {"会议日程", "大会日程", "日程", "AGENDA"}:
+                        continue
+                    if re.search(r"会议(?:时间|地点|地址|主席)|主办单位|腾讯会议", value):
+                        continue
+                    if len(marker) >= 4:
+                        lines.append(value)
+    except Exception as exc:
+        warnings.append(issue("agenda_title_ocr_failed", "日程顶部图片的会议名称识别失败，已保留为空供手动核对",
+                              detail=type(exc).__name__))
+        return ""
     return "".join(lines)
 
 
@@ -215,7 +238,8 @@ def classify_event(content):
         return "opening"
     if "总结" in value or "闭幕" in value:
         return "summary"
-    if "讨论" in value or "交流环节" in value:
+    # 圆桌对话等名称仍属于多人讨论环节，其中所有专家均按讨论嘉宾生成。
+    if any(marker in value for marker in DISCUSSION_EVENT_MARKERS):
         return "discussion"
     return "talk"
 
@@ -255,7 +279,7 @@ def parse_agenda(path, experts):
         info["title"] = "".join(compact(s["text"]) for s in title_shapes)
     if not info["title"]:
         # 有些日程把整段标题转成图片，使用本地OCR补充会议名称。
-        info["title"] = image_title(path, deck)
+        info["title"] = image_title(path, deck, info["issues"])
     current_hosts = []
     for slide in deck["slides"]:
         tables = [s for s in slide["shapes"] if s["table"] and any(TIME.search(compact("".join(r))) for r in s["table"])]
@@ -319,6 +343,10 @@ def parse_agenda(path, experts):
 def classify_slide(slide, repeated_titles, total_slides=None, deck_width=0, deck_height=0):
     texts = [compact(s["text"]) for s in slide["shapes"] if s["text"]]
     joined = "\n".join(texts)
+    # 整页表格同时包含多个时间段和各种环节名称，应识别为模板日程页。
+    if any(shape["kind"] == "graphicFrame" and len(TIME.findall(shape["text"])) >= 2
+           for shape in slide["shapes"]):
+        return "agenda"
     for word, role in [("讨论话题", "topics"), ("讨论问题", "topics"),
                        ("会议结束", "ending"), ("感谢聆听", "ending"), ("感谢观看", "ending"),
                        ("主席致辞", "opening"), ("开场致辞", "opening"), ("会议致辞", "opening"),
@@ -326,22 +354,27 @@ def classify_slide(slide, repeated_titles, total_slides=None, deck_width=0, deck
         if any(word == t or word in t for t in texts):
             return role
     deck_area = deck_width * deck_height
-    has_portrait = any(
+    portrait_count = sum(bool(
         shape.get("image")
         and shape["bbox"][1] > deck_height * .1
         and shape["bbox"][3] > deck_height * .18
         and .25 < shape["bbox"][2] / max(1, shape["bbox"][3]) < 1.7
         and (not deck_area or shape["bbox"][2] * shape["bbox"][3] < deck_area * .55)
-        for shape in slide["shapes"]
-    )
+    ) for shape in slide["shapes"])
+    has_portrait = portrait_count > 0
     has_bio = any(len(compact(shape["text"])) >= 45 for shape in slide["shapes"] if shape["text"])
+    # 多人讨论页可能包含多张头像，先识别讨论环节，避免被当成单人简介页。
+    if any(any(word in t for word in ("讨论环节", "讨论交流", "交流讨论", "互动讨论", "讨论互动",
+                                      "互动交流", "专家讨论", "点评与讨论", "分享与讨论", "圆桌对话", "圆桌交流"))
+           for t in texts):
+        return "discussion"
     if has_portrait or has_bio:
         for role, markers in ROLE_TEXTS.items():
             if any(marker in text for marker in markers for text in texts):
                 return role
-    if any(any(word in t for word in ("讨论环节", "讨论交流", "交流讨论", "互动讨论", "互动交流", "专家讨论"))
-           for t in texts):
-        return "discussion"
+    # 没有照片的专家页仍可通过长简介和单位区域识别为通用人物页。
+    if has_bio and any(hospital_in(shape["text"]) for shape in slide["shapes"] if shape["text"]):
+        return "guest"
     if slide["number"] == 1:
         return "cover"
     if total_slides and slide["number"] == total_slides and len(joined) < 80:
@@ -370,7 +403,7 @@ def infer_slide_fields(slide, role, repeated_titles=(), existing=None):
     for key, value in (existing or {}).items():
         values = value if isinstance(value, list) else [value]
         valid = [str(item) for item in values if str(item) in shape_ids]
-        if key in ("meeting", "metadata", "ending_content"):
+        if key in ("meeting", "metadata", "ending_content", "people", "people_photos"):
             fields[key] = valid
         elif valid:
             fields[key] = valid[0]
@@ -392,12 +425,14 @@ def infer_slide_fields(slide, role, repeated_titles=(), existing=None):
                 fields["bio"] = max(body_candidates, key=lambda shape: (len(compact(shape["text"])), shape["bbox"][2] * shape["bbox"][3]))["id"]
         identity_pool = [shape for shape in remaining if shape["id"] != fields.get("bio")]
         if not fields.get("identity") and identity_pool:
-            fields["identity"] = max(identity_pool, key=lambda shape: (
-                bool(names_in(shape["text"])),
-                not bool(hospital_in(shape["text"])),
-                shape["font"],
-                -len(compact(shape["text"])),
-            ))["id"]
+            def identity_score(shape):
+                lines = [compact(line) for line in shape["lines"] if compact(line)]
+                first = lines[0] if lines else ""
+                generic = ("嘉宾", "主席", "主持", "讲者", "讨论", "会议", "指南", "共识", "病例", "报告")
+                name_line = bool(re.fullmatch(r"[\u4e00-\u9fff·]{2,4}", first)) and not any(word in first for word in generic)
+                return (bool(names_in(shape["text"])) or name_line,
+                        bool(hospital_in(shape["text"])), shape["font"], -len(compact(shape["text"])))
+            fields["identity"] = max(identity_pool, key=identity_score)["id"]
         if not fields.get("hospital"):
             hospitals = [shape for shape in identity_pool if shape["id"] != fields.get("identity") and hospital_in(shape["text"])]
             if hospitals:
@@ -412,20 +447,57 @@ def infer_slide_fields(slide, role, repeated_titles=(), existing=None):
                 fields["photo"] = max(photos, key=lambda shape: shape["bbox"][2] * shape["bbox"][3])["id"]
     elif role in EVENT_ROLES:
         remaining = [shape for shape in texts if shape["id"] not in set(fields.get("meeting", []))]
-        attendees = [shape for shape in remaining if names_in(shape["text"]) or "{{people}}" in shape["text"]
-                     or re.search(r"教授|主任医师|主治医师|医生|医院", shape["text"])]
+
+        def event_person_shape(shape):
+            value = shape["text"]
+            lines = [compact(line) for line in shape["lines"] if compact(line)]
+            if names_in(value) or "{{people}}" in value or re.search(
+                    r"教授|主任医师|副主任医师|主治医师|医生|(?:^|\s)主任(?:\s|[/／]|$)", value):
+                return True
+            hospital = hospital_in(value)
+            if hospital:
+                prefix = compact(value).split(compact(hospital), 1)[0]
+                prefix = re.sub(r"教授|主任医师|副主任医师|主治医师|医生|主任", "", prefix)
+                if re.fullmatch(r"[\u4e00-\u9fff·]{2,6}", prefix):
+                    return True
+            # 姓名和药企、大学等单位分行显示时，也应识别为人员区域。
+            return bool(len(lines) >= 2 and re.fullmatch(r"[\u4e00-\u9fff·]{2,4}", lines[0])
+                        and re.search(r"医院|大学|中心|卫生院|药业|集团", lines[1]))
+
+        attendees = [shape for shape in remaining if event_person_shape(shape)]
         if not fields.get("people") and attendees:
-            fields["people"] = max(attendees, key=lambda shape: (len(compact(shape["text"])), shape["bbox"][1]))["id"]
-        title_pool = [shape for shape in remaining if shape["id"] != fields.get("people")]
+            ordered = geometry_order(attendees, slide.get("deck_height", 0))
+            fields["people"] = [shape["id"] for shape in ordered] if len(ordered) > 1 else ordered[0]["id"]
+        people_ids = set(fields.get("people", []) if isinstance(fields.get("people"), list) else [fields.get("people")])
+        role_markers = {compact(value) for values in ROLE_TEXTS.values() for value in values}
+        raw_title_pool = [shape for shape in remaining if shape["id"] not in people_ids]
+        title_pool = [shape for shape in raw_title_pool
+                      if not (len(compact(shape["text"])) <= 16
+                              and any(marker in compact(shape["text"]) for marker in role_markers))]
+        # 只有角色标题时仍使用该文本框，存在正文标题时优先正文区域。
+        title_pool = title_pool or raw_title_pool
         if not fields.get("title") and title_pool:
             fields["title"] = max(title_pool, key=lambda shape: (shape["font"], shape["bbox"][2], -shape["bbox"][1]))["id"]
+        if not fields.get("people_photos"):
+            photos = [shape for shape in shapes if shape.get("image")
+                      and shape["bbox"][1] > slide.get("deck_height", 0) * .1
+                      and shape["bbox"][3] > slide.get("deck_height", 0) * .15
+                      and .18 < shape["bbox"][2] / max(1, shape["bbox"][3]) < 2.2
+                      and shape["bbox"][2] * shape["bbox"][3] < slide.get("deck_area", float("inf")) * .35]
+            if photos:
+                # 多人页按从上到下、从左到右绑定姓名与头像。
+                fields["people_photos"] = [shape["id"] for shape in geometry_order(
+                    photos, slide.get("deck_height", 0))]
     elif role == "cover":
         remaining = [shape for shape in texts if shape["id"] not in set(fields.get("meeting", []))]
         choices = [shape for shape in remaining if not DATE.search(shape["text"]) and "主办" not in shape["text"]]
         if not choices:
-            choices = [shape for shape in texts if not DATE.search(shape["text"]) and "主办" not in shape["text"]]
+            # 标题和日期放在同一个文本框时，该文本框同时承担标题与元数据区域。
+            choices = [shape for shape in remaining if compact(DATE.sub("", shape["text"]))]
         if not fields.get("title") and choices:
             fields["title"] = max(choices, key=lambda shape: (shape["font"], shape["bbox"][2]))["id"]
+        if not fields.get("title") and fields.get("meeting"):
+            fields["title"] = fields["meeting"][0]
         metadata = [shape["id"] for shape in remaining if DATE.search(shape["text"]) or "主办" in shape["text"]]
         fields["metadata"] = list(dict.fromkeys(fields.get("metadata", []) + metadata))
     elif role == "ending":
@@ -445,7 +517,8 @@ def infer_slide_fields(slide, role, repeated_titles=(), existing=None):
 def analyze_template(path):
     deck = read_deck(path)
     counts = Counter(compact(s["text"]) for slide in deck["slides"] for s in slide["shapes"]
-                     if s["text"] and s["bbox"][1] < deck["height"] * .2)
+                     if s["text"] and s["bbox"][1] < deck["height"] * .2
+                     and s["bbox"][3] < deck["height"] * .18 and len(compact(s["text"])) <= 80)
     repeated = {text for text, count in counts.items() if count >= 3 and len(text) > 8}
     issues, slides = [], []
     for slide in deck["slides"]:
@@ -453,8 +526,8 @@ def analyze_template(path):
         shapes = slide["shapes"]
         enriched = {**slide, "deck_area": deck["width"] * deck["height"], "deck_height": deck["height"]}
         fields = infer_slide_fields(enriched, role, repeated)
-        required = (("bio", "identity", "photo") if role in PERSON_ROLES else
-                    ("people", "title") if role in EVENT_ROLES else
+        required = (("bio", "identity") if role in PERSON_ROLES else
+                    ("title",) if role in EVENT_ROLES else
                     ("title",) if role == "cover" else ())
         missing = [field for field in required if not fields.get(field)]
         if missing:
@@ -465,7 +538,9 @@ def analyze_template(path):
         if role == "topics":
             issues.append(issue("topic_policy", f"模板第{slide['number']}页包含讨论话题，默认排除，可选择每场保留", "warning", slide=slide["number"]))
         slides.append({**slide, "role": role, "fields": fields})
-    return {**deck, "slides": slides, "issues": issues, "fingerprint": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
+    # 分析规则升级后使用新的缓存键，避免继续套用旧版本的错误字段绑定。
+    fingerprint = hashlib.sha256(b"template-analyzer-v5\0" + Path(path).read_bytes()).hexdigest()
+    return {**deck, "slides": slides, "issues": issues, "fingerprint": fingerprint}
 
 
 def discover(folder):

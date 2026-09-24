@@ -17,7 +17,7 @@ from pathlib import Path
 from lxml import etree as ET
 from PIL import Image, ImageFont, ImageOps
 
-from .analyze import DATE, EVENT_ROLES, PERSON_ROLES, ROLES, infer_slide_fields, issue, names_in
+from .analyze import DATE, EVENT_ROLES, PERSON_ROLES, ROLES, ROLE_TEXTS, infer_slide_fields, issue, names_in
 from .bio import summarize_bio
 from .ooxml import NS, compact, encoded, paragraphs, read_deck, read_package, rel_path, resolve, tag, xml
 
@@ -30,6 +30,21 @@ def display_name(name):
     if len(value) == 2 and all("\u4e00" <= char <= "\u9fff" for char in value):
         return value[0] + " " + value[1]
     return value
+
+
+def balanced_lines(value, count):
+    """按模板原有段落数量均衡拆分标题，保留后续日期段落的独立格式。"""
+    text = str(value or "")
+    if count <= 1:
+        return [text]
+    if len(text) < count * 6:
+        return [text] + [""] * (count - 1)
+    result = []
+    for index in range(count):
+        start = round(len(text) * index / count)
+        end = round(len(text) * (index + 1) / count)
+        result.append(text[start:end])
+    return result
 
 
 def find_shape(root, shape_id):
@@ -53,13 +68,15 @@ def photo_frame_shape(slide, photo):
         if shape["id"] == photo["id"] or shape["kind"] != "sp" or shape["text"]:
             continue
         x, y, width, height = shape["bbox"]
-        if width <= 0 or height <= 0 or not .65 <= height / ph <= 1.35:
+        if width <= 0 or height <= 0 or not .55 <= height / ph <= 1.6:
             continue
         dx = abs(x - px) / pw
         dw = abs(width - pw) / pw
         db = abs((y + height) - (py + ph)) / ph
-        if dx <= .08 and dw <= .08 and db <= .08:
-            candidates.append((dx + dw + db, shape))
+        if dx <= .14 and dw <= .14 and db <= .14:
+            rounded = shape.get("geometry") in ("roundRect", "round1Rect", "round2SameRect", "round2DiagRect")
+            # 圆角矩形优先，其次按横向位置、宽度和底边的接近程度选择。
+            candidates.append((dx + dw + db - (.2 if rounded else 0), shape))
     return min(candidates, key=lambda item: item[0])[1] if candidates else None
 
 
@@ -103,6 +120,36 @@ def bring_to_front(node):
         parent.insert(parent.index(extension), node)
 
 
+def template_run_properties(paragraph, body):
+    """合并模板文字片段与段落默认样式，得到新文字应使用的完整格式。"""
+    candidates = paragraph.xpath('./a:r | ./a:fld', namespaces=NS)
+    selected = next((run for run in candidates
+                     if ''.join(run.xpath('./a:t/text()', namespaces=NS)).strip()), None)
+    primary = selected.find('a:rPr', NS) if selected is not None else paragraph.find('a:endParaRPr', NS)
+    result = copy.deepcopy(primary) if primary is not None else ET.Element(tag("a", "rPr"))
+    ppr = paragraph.find('a:pPr', NS)
+    level = int(ppr.get('lvl', '0')) + 1 if ppr is not None else 1
+    defaults = []
+    if ppr is not None:
+        defaults.append(ppr.find('a:defRPr', NS))
+    defaults.extend(body.xpath(f'./a:lstStyle/a:lvl{level}pPr/a:defRPr | ./a:lstStyle/a:defPPr/a:defRPr',
+                               namespaces=NS))
+    # 文字片段的显式格式优先，缺少的字体、字号及颜色从最近的模板默认样式补齐。
+    for fallback in defaults:
+        if fallback is None:
+            continue
+        for key, value in fallback.attrib.items():
+            if key not in result.attrib:
+                result.set(key, value)
+        existing = {child.tag for child in result}
+        for child in fallback:
+            if child.tag not in existing and ET.QName(child).localname not in ('hlinkClick', 'hlinkMouseOver'):
+                result.append(copy.deepcopy(child))
+                existing.add(child.tag)
+    clear_links(result)
+    return result
+
+
 def set_text(node, lines, *, font=None, preserve_sizes=True, line_spacing=None):
     metadata = node.find('.//p:cNvPr', NS)
     if metadata is not None:
@@ -124,7 +171,7 @@ def set_text(node, lines, *, font=None, preserve_sizes=True, line_spacing=None):
         if ppr is not None:
             p.append(copy.deepcopy(ppr))
         if line_spacing is not None:
-            # 专家简介固定字号后，通过统一行距保证八行仍落在模板文本框内。
+            # 专家简介固定字号后，通过统一行距保证十二行仍落在模板文本框内。
             ppr = p.find("a:pPr", NS)
             if ppr is None:
                 ppr = ET.Element(tag("a", "pPr"))
@@ -136,15 +183,8 @@ def set_text(node, lines, *, font=None, preserve_sizes=True, line_spacing=None):
                 spacing.remove(child)
             ET.SubElement(spacing, tag("a", "spcPct"), val=str(round(line_spacing * 100000)))
         run = ET.SubElement(p, tag("a", "r"))
-        runs = [r for r in original.findall('a:r', NS) if ''.join(r.xpath('./a:t/text()', namespaces=NS)).strip()]
-        # 空白占位符常带有异常字号，只继承实际文字的格式。
-        props = [r.find('a:rPr', NS) for r in runs if r.find('a:rPr', NS) is not None]
-        selected = props[0] if props else original.find('a:endParaRPr', NS)
-        if selected is None:
-            defaults = body.xpath('./a:lstStyle//a:defRPr', namespaces=NS)
-            selected = defaults[0] if defaults else None
-        rpr = copy.deepcopy(selected) if selected is not None else ET.Element(tag("a", "rPr"))
-        clear_links(rpr)
+        # 空白占位符常带有异常字号，只使用实际文字及其所在段落的模板格式。
+        rpr = template_run_properties(original, body)
         if font is not None:
             rpr.set("sz", str(round(font * 100)))
         run.append(rpr)
@@ -173,13 +213,20 @@ def text_width(value, font):
 
 def text_box(node, shape, font_size=None):
     body = node.find("p:txBody/a:bodyPr", NS)
+    text_body = node.find("p:txBody", NS)
     width = shape["bbox"][2] / 12700
     height = shape["bbox"][3] / 12700
     if body is not None:
         width -= (int(body.get("lIns", "91440")) + int(body.get("rIns", "91440"))) / 12700
         height -= (int(body.get("tIns", "45720")) + int(body.get("bIns", "45720"))) / 12700
-    size = font_size or shape["font"]
-    families = node.xpath(".//a:rPr/a:ea/@typeface | .//a:rPr/a:latin/@typeface", namespaces=NS)
+    template_paragraph = next((paragraph for paragraph in node.findall('p:txBody/a:p', NS)
+                               if ''.join(paragraph.xpath('.//a:t/text()', namespaces=NS)).strip()), None)
+    style = template_run_properties(template_paragraph, text_body) if template_paragraph is not None else None
+    size = font_size or (int(style.get('sz')) / 100 if style is not None and style.get('sz') else shape["font"])
+    families = (style.xpath("./a:ea/@typeface | ./a:latin/@typeface", namespaces=NS)
+                if style is not None else [])
+    if not families:
+        families = node.xpath(".//a:rPr/a:ea/@typeface | .//a:rPr/a:latin/@typeface", namespaces=NS)
     family = families[0] if families else ""
     # 留出字体替换与Office排版差异的余量，估算通过仍需实际预览。
     return max(10, width * .95), max(10, height * .93), size, family
@@ -214,10 +261,47 @@ def fit_lines(node, shape, lines, minimum=14):
     width, height, original_size, family = text_box(node, shape)
     if compact(''.join(paragraphs(node))) == compact(''.join(lines)):
         return False, original_size
-    # 新文字完整继承模板段落的字号、字体、颜色和行距，不再自动覆盖字号。
-    overflow = estimated_height(lines, width, original_size, family, node) > height
-    set_text(node, lines)
-    return overflow, original_size
+    size = original_size
+    lower_bound = min(original_size, minimum)
+    font = measure_font(size, family)
+    needs_wrap = any(text_width(line, font) > width for line in lines)
+    # 优先沿用模板字号，发生溢出后才逐级缩小，并保持在模板文本框内换行。
+    while size > lower_bound and estimated_height(lines, width, size, family, node) > height:
+        size = max(lower_bound, size - .5)
+    overflow = estimated_height(lines, width, size, family, node) > height
+    set_text(node, lines, font=size if size < original_size else None)
+    if needs_wrap or size < original_size:
+        body = node.find("p:txBody/a:bodyPr", NS)
+        if body is not None:
+            body.set("wrap", "square")
+    return overflow, size
+
+
+def fit_meeting_title(node, shape, value, single_line_minimum=14, minimum=8):
+    """会议名称优先保持单行，过长时在模板文本框内自动换行并缩放。"""
+    width, height, original_size, family = text_box(node, shape)
+    text = str(value or "")
+    measured = text_width(text, measure_font(original_size, family))
+    single_line_size = original_size
+    if measured > width and measured > 0:
+        # 按可用宽度等比缩小，并留出Office字体替换造成的排版余量。
+        single_line_size = original_size * width / measured * .96
+    body = node.find("p:txBody/a:bodyPr", NS)
+    if single_line_size >= single_line_minimum:
+        size = min(original_size, single_line_size)
+        overflow = text_width(text, measure_font(size, family)) > width
+        if body is not None:
+            body.set("wrap", "none")
+    else:
+        # 单行字号过小时恢复换行，并逐级缩小到宽度和高度都落在模板框内。
+        size = original_size
+        while size > minimum and estimated_height([text], width, size, family, node) > height:
+            size = max(minimum, size - .25)
+        overflow = estimated_height([text], width, size, family, node) > height
+        if body is not None:
+            body.set("wrap", "square")
+    set_text(node, [text], font=size if size < original_size else None)
+    return overflow, size
 
 
 def select_single_page_bio(node, shape, person):
@@ -304,9 +388,9 @@ def validate_model(model):
                     continue
                 if sid not in shapes:
                     warnings.append(issue("template_field_invalid", f"模板第{slide['number']}页区域不存在，生成时重新识别", slide=slide["number"]))
-                elif field == "photo" and not shapes[sid].get("image"):
+                elif field in ("photo", "people_photos") and not shapes[sid].get("image"):
                     warnings.append(issue("template_photo_invalid", f"模板第{slide['number']}页照片区域类型无效，生成时保留空白", slide=slide["number"]))
-                elif field != "photo" and shapes[sid]["kind"] != "sp":
+                elif field not in ("photo", "people_photos") and shapes[sid]["kind"] != "sp":
                     warnings.append(issue("template_text_invalid", f"模板第{slide['number']}页文字区域无法编辑，生成时保留原布局", slide=slide["number"]))
                 if field not in ("meeting", "metadata"):
                     assigned.append(sid)
@@ -335,7 +419,8 @@ def page_plan(model):
             complete = sum(bool(fields.get(field)) for field in required)
             same_group = ((role in PERSON_ROLES and slide["role"] in PERSON_ROLES)
                           or (role in EVENT_ROLES and slide["role"] in EVENT_ROLES))
-            score = complete * 35 + (60 if slide["role"] == role else 0) + (25 if same_group else 0)
+            # 完整填充区域优先于角色名称完全相同，避免选中缺少人员或照片的空布局。
+            score = complete * 50 + (45 if slide["role"] == role else 0) + (25 if same_group else 0)
             if role == "cover":
                 score += max(0, 20 - slide["number"])
             elif role == "ending":
@@ -543,19 +628,35 @@ def generate(model, destination):
                 if relation.get("Type", "").endswith(("/notesSlide", "/comments", "/slide")):
                     rels.remove(relation)
             clear_links(root)
-            if role != "ending":
-                for sid in fields.get("meeting", []):
-                    node = find_shape(root, sid)
-                    overflow, _ = fit_lines(node, shape_info(source, sid), [agenda.get("title", "")], minimum=16)
-                    if overflow:
-                        messages.append(issue("text_fit", f"第{len(output_plan)+1}页会议标题可能溢出"))
+            # 所有页面的页眉会议名称都使用单行自适应，结束页也不能保留模板旧标题。
+            for sid in fields.get("meeting", []):
+                node = find_shape(root, sid)
+                overflow, _ = fit_meeting_title(node, shape_info(source, sid), agenda.get("title", ""))
+                if overflow:
+                    messages.append(issue("text_fit", f"第{len(output_plan)+1}页会议标题可能溢出"))
             if role == "cover":
-                if fields.get("title"):
-                    sid = fields["title"]
+                title_id = fields.get("title")
+                metadata_ids = fields.get("metadata", [])
+                if title_id and title_id not in metadata_ids:
+                    sid = title_id
                     fit_lines(find_shape(root, sid), shape_info(source, sid), [agenda.get("title", "")], minimum=24)
-                for sid in fields.get("metadata", []):
+                for sid in metadata_ids:
                     node = find_shape(root, sid)
                     lines = paragraphs(node)
+                    if sid == title_id:
+                        # 标题与日期共用文本框时，按原段落数量分别替换，避免日期样式被标题覆盖。
+                        title_slots = sum(not DATE.search(line) and "主办" not in line for line in lines)
+                        title_lines = iter(balanced_lines(agenda.get("title", ""), max(1, title_slots)))
+                        new_lines = []
+                        for line in lines:
+                            if DATE.search(line):
+                                new_lines.append(agenda.get("date", ""))
+                            elif "主办" in line:
+                                new_lines.append("主办单位：" + agenda["organizer"] if agenda.get("organizer") else "")
+                            else:
+                                new_lines.append(next(title_lines, ""))
+                        set_text(node, new_lines)
+                        continue
                     new_lines = []
                     for line in lines:
                         if DATE.search(line):
@@ -588,14 +689,23 @@ def generate(model, destination):
                 else:
                     identity_lines.append(person["display_hospital"])
                 if fields.get("identity"):
-                    set_text(find_shape(root, fields["identity"]), identity_lines)
+                    identity_id = fields["identity"]
+                    fit_lines(find_shape(root, identity_id), shape_info(source, identity_id), identity_lines, minimum=14)
                 if fields.get("bio") and summary:
                     body = find_shape(root, fields["bio"])
                     set_text(body, body_lines)
-                if fields.get("role"):
-                    role_node = find_shape(root, fields["role"])
-                    label = ROLE_LABELS[role]
-                    fit_lines(role_node, shape_info(source, fields["role"]), [label], minimum=10)
+                # 回退复用其他人物页时，统一替换页面中识别到的旧角色文字。
+                role_markers = {compact(value) for values in ROLE_TEXTS.values() for value in values}
+                role_ids = [fields.get("role")]
+                role_ids.extend(shape["id"] for shape in source["shapes"]
+                                if shape["kind"] == "sp" and shape["text"]
+                                and len(compact(shape["text"])) <= 16
+                                and any(marker in compact(shape["text"]) for marker in role_markers))
+                role_ids = list(dict.fromkeys(shape_id for shape_id in role_ids if shape_id))
+                label = ROLE_LABELS[role]
+                for role_id in role_ids:
+                    role_node = find_shape(root, role_id)
+                    fit_lines(role_node, shape_info(source, role_id), [label], minimum=10)
                 photo_node = find_shape(root, fields["photo"]) if fields.get("photo") else None
                 if person.get("photo") and photo_node is not None:
                     photo_shape = shape_info(source, fields["photo"])
@@ -606,9 +716,10 @@ def generate(model, destination):
                         align_shape_bbox(photo_node, photo_shape["bbox"], frame_shape["bbox"])
                         replacement_shape = {**photo_shape, "bbox": frame_shape["bbox"]}
                     replace_photo(photo_node, rels, package, person, replacement_shape, cache)
-                    if fields.get("role"):
+                    if role_ids:
                         # 图片充满框后，将角色标签置于照片上层，避免标签被照片遮挡。
-                        bring_to_front(find_shape(root, fields["role"]))
+                        for role_id in role_ids:
+                            bring_to_front(find_shape(root, role_id))
                 elif photo_node is not None:
                     photo_node.getparent().remove(photo_node)
                     messages.append(issue("photo_missing", f"{person['name']}未填入照片，旧照片已清除"))
@@ -618,12 +729,31 @@ def generate(model, destination):
                     p = expert_data(name)
                     lines.append("  ".join(v for v in (display_name(name), p["display_title"], p["display_hospital"]) if v))
                 for field, values, minimum in [("people", lines, 18), ("title", [item["title"]], 24)]:
-                    sid = fields.get(field)
-                    if not sid:
+                    shape_ids = fields.get(field)
+                    if not shape_ids:
                         continue
-                    overflow, _ = fit_lines(find_shape(root, sid), shape_info(source, sid), values, minimum)
-                    if overflow:
-                        messages.append(issue("text_fit", f"第{len(output_plan)+1}页{field}区域可能溢出，请检查预览"))
+                    shape_ids = shape_ids if isinstance(shape_ids, list) else [shape_ids]
+                    for index, sid in enumerate(shape_ids):
+                        if field == "people" and len(shape_ids) > 1:
+                            current = values[index:index + 1] if index < len(shape_ids) - 1 else values[index:]
+                        else:
+                            current = values
+                        overflow, _ = fit_lines(find_shape(root, sid), shape_info(source, sid), current, minimum)
+                        if overflow:
+                            messages.append(issue("text_fit", f"第{len(output_plan)+1}页{field}区域可能溢出，请检查预览"))
+                # 多头像讨论页按名单顺序替换照片，多余旧照片直接清除。
+                photo_ids = fields.get("people_photos", [])
+                photo_ids = photo_ids if isinstance(photo_ids, list) else [photo_ids]
+                for index, photo_id in enumerate(photo_ids):
+                    photo_node = find_shape(root, photo_id)
+                    if index >= len(item["people"]):
+                        photo_node.getparent().remove(photo_node)
+                        continue
+                    person = expert_data(item["people"][index])
+                    if person.get("photo"):
+                        replace_photo(photo_node, rels, package, person, shape_info(source, photo_id), cache)
+                    else:
+                        photo_node.getparent().remove(photo_node)
             number = len(output_plan) + 1
             part = f"ppt/slides/autoppt{number}.xml"
             package[part] = encoded(root)
@@ -686,9 +816,14 @@ def generate(model, destination):
                          for name in event.get('people', []) + event.get('hosts', []) if name}
         old_names = set()
         for source in profile.values():
-            identity_ids = {source['fields'].get('identity'), source['fields'].get('people')}
+            identity_ids = set()
+            for field in ('identity', 'people'):
+                values = source['fields'].get(field, [])
+                identity_ids.update(values if isinstance(values, list) else [values])
+            identity_ids.discard(None)
+            identity_ids.discard('')
             identity_text = '\n'.join(s['text'] for s in source['shapes'] if s['id'] in identity_ids)
-            old_names.update(names_in(identity_text, current_names))
+            old_names.update(names_in(identity_text))
         old_names -= current_names
         for page, spec in zip(checked['slides'], output_plan):
             if spec['role'] == 'topics':
