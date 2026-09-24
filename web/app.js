@@ -5,13 +5,13 @@ let config, jobId, model, pollTimer, mode='ppt';
 const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 const people = value => value.split(/[、,，;；\n]+/).map(s => s.trim()).filter(Boolean);
 const roleFields = {
-  cover:['title','metadata','meeting'], opening:['title','people','people_photos','meeting'], summary:['title','people','people_photos','meeting'],
-  talk:['title','people','people_photos','meeting'], discussion:['title','people','people_photos','meeting'],
+  cover:['title','metadata','meeting'], opening:['title','people','meeting'], summary:['title','people','meeting'],
+  talk:['title','people','meeting'], discussion:['title','people','meeting'],
   chair:['identity','hospital','bio','photo','role','meeting'], host:['identity','hospital','bio','photo','role','meeting'],
   speaker:['identity','hospital','bio','photo','role','meeting'], guest:['identity','hospital','bio','photo','role','meeting'],
-  agenda:['meeting'], topics:['meeting'], ending:['meeting'], unknown:['meeting']
+  topics:['meeting'], ending:['meeting'], unknown:['meeting']
 };
-const fieldNames = {title:'主标题',metadata:'日期主办',meeting:'会议名称',people:'人员名单',people_photos:'人员照片',identity:'专家姓名',hospital:'独立单位框',bio:'专家简介',photo:'专家照片',role:'角色标签'};
+const fieldNames = {title:'主标题',metadata:'日期主办',meeting:'会议名称',people:'人员名单',identity:'专家姓名',hospital:'独立单位框',bio:'专家简介',photo:'专家照片',role:'角色标签'};
 
 function notice(text='') { $('#notice').textContent=text; $('#notice').hidden=!text; }
 function showPage(id) { const step=id.includes('result')?'result':id.includes('review')?'review':'upload'; $$('.page').forEach(p=>p.hidden=p.id!==id); $$('.step').forEach(b=>b.classList.toggle('active',b.dataset.step===step)); window.scrollTo(0,0); }
@@ -58,7 +58,7 @@ function renderAgenda() {
 function renderExperts() {
   $('#experts-list').innerHTML=model.experts.map((e,i)=>{
     const detail=model.agenda.people[e.name]||{};const current=e.photos.find(p=>p.image===e.photo);
-    return `<div class="panel expert-card" data-expert="${i}"><div>${current?`<img class="expert-photo" src="${current.thumbnail}" alt="${escapeHTML(e.name)}资料照片">`:'<div class="expert-photo"></div>'}<div class="expert-source">${escapeHTML(e.source)}</div>${e.photos.length>1?`<select aria-label="选择照片" data-expert-field="photo">${e.photos.map((p,j)=>`<option value="${escapeHTML(p.image)}" ${p.image===e.photo?'selected':''}>候选照片${j+1}</option>`).join('')}</select>`:''}${!e.photo_confirmed?'<label class="hint"><input type="checkbox" data-confirm-photo>已确认当前照片</label>':''}</div><div class="expert-fields"><label>姓名<input data-expert-field="name" value="${escapeHTML(e.name)}"></label><label>会议展示单位<input data-person-field="hospital" value="${escapeHTML(detail.hospital||e.hospital)}"></label><label>会议展示称呼<input data-person-field="display_title" value="${escapeHTML(detail.display_title||'')}"></label><label class="bio">简介原文 · 生成时整理为最多12条<textarea data-expert-field="bio">${escapeHTML(e.bio.join('\n'))}</textarea></label></div></div>`;
+    return `<div class="panel expert-card" data-expert="${i}"><div>${current?`<img class="expert-photo" src="${current.thumbnail}" alt="${escapeHTML(e.name)}资料照片">`:'<div class="expert-photo"></div>'}<div class="expert-source">${escapeHTML(e.source)}</div>${e.photos.length>1?`<select aria-label="选择照片" data-expert-field="photo">${e.photos.map((p,j)=>`<option value="${escapeHTML(p.image)}" ${p.image===e.photo?'selected':''}>候选照片${j+1}</option>`).join('')}</select>`:''}${!e.photo_confirmed?'<label class="hint"><input type="checkbox" data-confirm-photo>已确认当前照片</label>':''}</div><div class="expert-fields"><label>姓名<input data-expert-field="name" value="${escapeHTML(e.name)}"></label><label>会议展示单位<input data-person-field="hospital" value="${escapeHTML(detail.hospital||e.hospital)}"></label><label>会议展示称呼<input data-person-field="display_title" value="${escapeHTML(detail.display_title||'')}"></label><label class="bio">简介原文 · 生成时整理为最多8条<textarea data-expert-field="bio">${escapeHTML(e.bio.join('\n'))}</textarea></label></div></div>`;
   }).join('');
   $$('#experts-list [data-expert-field]').forEach(input=>input.onchange=()=>{
     const e=model.experts[+input.closest('[data-expert]').dataset.expert];const key=input.dataset.expertField;
@@ -80,8 +80,8 @@ function renderTemplate() {
   const template=model.template;
   $('#template-list').innerHTML=template.slides.map((s,i)=>{
     const mapping=(roleFields[s.role]||[]).map(key=>{
-      const multiple=['meeting','metadata','people','people_photos'].includes(key);const selected=multiple?(Array.isArray(s.fields[key])?s.fields[key]:[s.fields[key]].filter(Boolean)):[s.fields[key]];
-      const shapes=s.shapes.filter(shape=>['photo','people_photos'].includes(key)?shape.kind==='pic':Boolean(shape.text));
+      const multiple=['meeting','metadata'].includes(key);const selected=multiple?(s.fields[key]||[]):[s.fields[key]];
+      const shapes=s.shapes.filter(shape=>key==='photo'?shape.kind==='pic':Boolean(shape.text));
       return `<label>${fieldNames[key]}<select data-mapping="${key}" ${multiple?'multiple':''}><option value="">不填充</option>${shapes.map(shape=>`<option value="${shape.id}" ${selected.includes(shape.id)?'selected':''}>${escapeHTML(shape.id+' · '+(shape.text||shape.name).slice(0,42))}</option>`).join('')}</select></label>`;
     }).join('');
     return `<div class="template-card" data-slide="${i}">${structure(s,template.width,template.height)}<div class="card-head"><span class="number">第${s.number}页</span><select aria-label="页面用途" data-role>${Object.entries(config.roles).map(([k,v])=>`<option value="${k}" ${s.role===k?'selected':''}>${v}</option>`).join('')}</select></div><details class="mapping"><summary>查看与调整填充区域</summary>${mapping}</details></div>`;

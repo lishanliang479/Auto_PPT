@@ -161,9 +161,6 @@ def slide_shapes(root, package, part):
             shape = {"id": prop.get("id"), "name": prop.get("name", ""), "kind": kind,
                      "lines": lines, "text": "\n".join(lines), "bbox": bbox,
                      "font": max(fonts, default=18), "table": []}
-            geometry_node = node.find(".//a:prstGeom", NS)
-            # 保存形状几何类型，便于照片替换时优先匹配圆角头像框。
-            shape["geometry"] = geometry_node.get("prst", "") if geometry_node is not None else ""
             xfrm = node.find("p:spPr/a:xfrm", NS)
             if xfrm is None:
                 xfrm = node.find("a:xfrm", NS)

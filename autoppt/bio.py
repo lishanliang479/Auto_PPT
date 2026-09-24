@@ -16,7 +16,6 @@ DEPARTMENT = re.compile(r'科|病区|病房|院区|中心|EICU|ICU|院长|院士
 HEADINGS = {'学术兼职', '学术任职', '社会兼职', '专业特长', '课题', '科研项目', '研究方向', '获奖', '荣誉'}
 MEETING_ROLE_PREFIX = re.compile(r'^(?:(?:大会|会议|环节)?(?:讨论嘉宾|讨论专家|讲者|主持人?|主席|讨论))(?:[:：]\s*)?')
 MEETING_TOPIC_PREFIX = re.compile(r'^(?:(?:大会|会议|环节)?(?:讲者|主持人?|主席|讨论))主题[:：]?')
-MAX_BIO_LINES = 12
 
 
 def clean(value):
@@ -33,6 +32,26 @@ def unique(values):
         if value and compact(value) not in {compact(x) for x in result}:
             result.append(value)
     return result
+
+
+def social_score(value):
+    """同类任职先比较机构范围，再比较职务，分数相同时保留原文顺序。"""
+    scope = 300 if re.search(r'^(中国|中华|全国|CSCO|国际|亚太)', value, re.I) else 200 if '省' in value else 100
+    rank = 90 if re.search(r'(?<!副)(?:主任委员|主委|理事长|会长)', value) else 75 if re.search(r'副主任委员|副主委|副理事长|副会长', value) else 60 if re.search(r'常委|常务|副组长|组长', value) else 40 if '理事' in value else 20
+    return scope + rank
+
+
+def other_score(value):
+    """个人介绍优先专业方向和擅长内容，其次保留成果与重要履历。"""
+    if re.search(r'擅长|研究方向|专业特长|长期从事|从事|临床|临证|熟练|专注|致力', value):
+        return 400
+    if re.search(r'获奖|荣获|人才|荣誉|称号|成就奖', value):
+        return 300
+    if re.search(r'发表|科研|课题|基金|著作|出版|参研', value, re.I):
+        return 200
+    if re.search(r'主任|书记|院长', value):
+        return 100
+    return 0
 
 
 def split_other_line(value):
@@ -84,7 +103,7 @@ def split_social_line(value):
 
 
 def summarize_bio(expert):
-    """整理最多十二条简介，优先临床信息、学校履历和原文社会任职。"""
+    """整理最多八条简介，优先临床信息、学校履历和重要社会任职。"""
     source = [line for value in expert.get('bio', [])
               for line in [bio_source_line(value, expert.get('name', ''))] if line]
     if source == ['简介待补充']:
@@ -173,9 +192,8 @@ def summarize_bio(expert):
     academic = unique(academic)
     academic.sort(key=lambda x: (0 if re.search(r'导师|硕导|博导|生导', x) else 1 if re.search(r'博士|硕士', x) else 2))
     second = '，'.join(academic[:2])
-    # 其他领域职称和个人简介按原资料出现顺序展示，避免自动排序改变作者表达顺序。
-    social = unique(social)
-    other = unique(other)
+    social = sorted(unique(social), key=lambda x: -social_score(x))
+    other = sorted(unique(other), key=lambda value: -other_score(value))
     missing = []
     if not first:
         missing.append('医院及临床职务')
@@ -190,9 +208,9 @@ def summarize_bio(expert):
     for value in social + other:
         if value and compact(value) not in {compact(x) for x in lines}:
             lines.append(value)
-        if len(lines) == MAX_BIO_LINES:
+        if len(lines) == 8:
             break
     selected_social = [x for x in lines if x in social]
-    return {'lines': lines[:MAX_BIO_LINES], 'clinical': first, 'academic': second, 'social': social, 'other': other,
+    return {'lines': lines[:8], 'clinical': first, 'academic': second, 'social': social, 'other': other,
             'selected_social': selected_social, 'placeholders': [],
             'source': list(expert.get('bio', [])), 'missing': missing}

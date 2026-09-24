@@ -131,7 +131,7 @@ def apply_edits(original, incoming):
     slides = incoming.get("template", {}).get("slides", [])
     if len(slides) != len(model["template"]["slides"]):
         raise ValueError("模板页面数量发生变化")
-    allowed = {"meeting", "metadata", "role", "bio", "identity", "photo", "hospital", "people", "people_photos", "title"}
+    allowed = {"meeting", "metadata", "role", "bio", "identity", "photo", "hospital", "people", "title"}
     for slide, update in zip(model["template"]["slides"], slides):
         if update.get("role") not in ROLES:
             raise ValueError("页面角色无效")
@@ -144,7 +144,7 @@ def apply_edits(original, incoming):
             values = value if isinstance(value, list) else [value]
             if any(v and v not in ids for v in values):
                 raise ValueError("文本框或图片区域无效")
-            fields[key] = [v for v in values if v] if key in ("meeting", "metadata", "people", "people_photos") else (values[0] if values else "")
+            fields[key] = [v for v in values if v] if key in ("meeting", "metadata") else (values[0] if values else "")
         slide["fields"] = fields
     for key in ("draft", "repeat_chairs", "include_topics"):
         if key in incoming.get("options", {}):

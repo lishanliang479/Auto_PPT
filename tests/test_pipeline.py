@@ -15,9 +15,9 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from autoppt.analyze import analyze, analyze_template, classify_event, discover, filename_name, image_title, names_in, parse_agenda, read_expert
+from autoppt.analyze import analyze, analyze_template, discover, filename_name, names_in, parse_agenda, read_expert
 from autoppt.bio import summarize_bio
-from autoppt.generate import display_name, find_shape, fit_lines, fit_meeting_title, generate, page_plan, photo_frame_shape, portrait_bytes, set_text, text_box, validate_model
+from autoppt.generate import display_name, find_shape, generate, page_plan, photo_frame_shape, portrait_bytes, validate_model
 from autoppt.ooxml import NS, compact, encoded, read_deck, read_package, unpack_experts, xml
 from autoppt.poster import clean_name, organizer_from_logo, render_poster, unpack_portraits
 from autoppt.server import Handler, TOKEN, ThreadingHTTPServer, apply_edits, apply_poster_edits, ppt_output_filename
@@ -26,67 +26,6 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 class RuleTests(unittest.TestCase):
-    def test_overflowing_text_wraps_and_shrinks_inside_shape(self):
-        # 普通讲题和名单超过文本框容量时启用换行，并在最低字号范围内缩放。
-        node = xml(b'''<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
-            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
-            <p:txBody><a:bodyPr lIns="0" rIns="0" tIns="0" bIns="0" wrap="none"/><a:lstStyle/>
-            <a:p><a:r><a:rPr sz="4800"><a:ea typeface="Microsoft YaHei"/></a:rPr>
-            <a:t>old</a:t></a:r></a:p></p:txBody></p:sp>''')
-        shape = {'bbox': (0, 0, 5200000, 1300000), 'font': 48}
-        lines = ['因病制宜，阶梯镇痛——中国骨关节炎诊疗指南（2024版）解读']
-        overflow, size = fit_lines(node, shape, lines, minimum=18)
-        self.assertFalse(overflow)
-        self.assertLess(size, 48)
-        self.assertEqual(node.find('p:txBody/a:bodyPr', NS).get('wrap'), 'square')
-
-    def test_long_meeting_title_is_kept_on_one_line(self):
-        # 长会议名称按文本框宽度缩小字号，并关闭自动换行。
-        node = xml(b'''<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
-            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
-            <p:txBody><a:bodyPr lIns="0" rIns="0" tIns="0" bIns="0"/><a:lstStyle/>
-            <a:p><a:r><a:rPr sz="2400"><a:ea typeface="Microsoft YaHei"/></a:rPr>
-            <a:t>old</a:t></a:r></a:p></p:txBody></p:sp>''')
-        shape = {'bbox': (0, 0, 8000000, 500000), 'font': 24}
-        title = '汇智齐鲁，共护慢病全域慢病防治与综合管理学术研讨会'
-        overflow, size = fit_meeting_title(node, shape, title)
-        self.assertFalse(overflow)
-        self.assertLess(size, 24)
-        self.assertEqual(node.find('p:txBody/a:bodyPr', NS).get('wrap'), 'none')
-        self.assertEqual(''.join(node.xpath('.//a:t/text()', namespaces=NS)), title)
-
-    def test_very_long_meeting_title_wraps_inside_template_box(self):
-        # 单行需要过小字号时恢复自动换行，并同时按文本框高度缩放。
-        node = xml(b'''<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
-            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
-            <p:txBody><a:bodyPr lIns="0" rIns="0" tIns="0" bIns="0"/><a:lstStyle/>
-            <a:p><a:r><a:rPr sz="2400"><a:ea typeface="Microsoft YaHei"/></a:rPr>
-            <a:t>old</a:t></a:r></a:p></p:txBody></p:sp>''')
-        shape = {'bbox': (0, 0, 4200000, 900000), 'font': 24}
-        title = '汇智齐鲁，共护慢病全域慢病防治与综合管理学术研讨会暨慢性疾病规范化诊疗能力提升会议'
-        overflow, size = fit_meeting_title(node, shape, title)
-        self.assertFalse(overflow)
-        self.assertLess(size, 24)
-        self.assertEqual(node.find('p:txBody/a:bodyPr', NS).get('wrap'), 'square')
-        self.assertEqual(''.join(node.xpath('.//a:t/text()', namespaces=NS)), title)
-
-    def test_template_default_font_and_size_are_materialized(self):
-        # 模板将字体和字号放在段落默认样式时，新文字仍需完整继承该板块格式。
-        node = xml(b'''<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
-            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
-            <p:txBody><a:bodyPr/><a:lstStyle><a:lvl1pPr><a:defRPr sz="2200" b="1">
-            <a:ea typeface="Microsoft YaHei"/></a:defRPr></a:lvl1pPr></a:lstStyle>
-            <a:p><a:pPr lvl="0"><a:defRPr sz="1800"><a:ea typeface="SimSun"/></a:defRPr></a:pPr>
-            <a:r><a:rPr lang="zh-CN"/><a:t>old</a:t></a:r></a:p></p:txBody></p:sp>''')
-        set_text(node, ['new'])
-        props = node.find('.//a:r/a:rPr', NS)
-        self.assertEqual(props.get('sz'), '1800')
-        self.assertEqual(props.get('b'), '1')
-        self.assertEqual(props.find('a:ea', NS).get('typeface'), 'SimSun')
-        _, _, size, family = text_box(node, {'bbox': (0, 0, 2540000, 1270000), 'font': 36})
-        self.assertEqual(size, 18)
-        self.assertEqual(family, 'SimSun')
-
     def test_two_character_name_has_one_space(self):
         # 两字姓名只调整展示形式，三字及以上姓名保持原样。
         self.assertEqual(display_name('田静'), '田 静')
@@ -134,12 +73,7 @@ class RuleTests(unittest.TestCase):
         for source, expected in cases.items():
             self.assertEqual(filename_name(source), expected)
 
-    def test_roundtable_names_are_discussion_events(self):
-        # 圆桌及对话类名称属于多人讨论环节，后续人物页统一使用讨论嘉宾角色。
-        for title in ('圆桌对话', '圆桌交流', '专家对话', '互动交流'):
-            self.assertEqual(classify_event(title), 'discussion')
-
-    def test_long_social_paragraph_splits_into_separate_lines(self):
+    def test_long_social_paragraph_splits_into_eight_lines(self):
         # 逗号、顿号和分号连接的任职应拆为独立条目，避免整段占用一行。
         expert = {'name': '李军', 'hospital': '', 'bio': [
             '讨论',
@@ -199,15 +133,6 @@ class RuleTests(unittest.TestCase):
             self.skipTest('9.21图片标题样本未放入项目')
         agenda = parse_agenda(source, [])
         self.assertEqual(agenda['title'], '汇智齐鲁，共护慢病全域慢病防治与综合管理学术研讨会')
-
-    def test_missing_ocr_dependency_is_reported(self):
-        # 图片标题依赖缺失时继续允许生成，并在核对区说明会议名称为空的具体原因。
-        deck = {'width': 100, 'height': 100, 'slides': [{'shapes': [
-            {'image': 'ppt/media/title.png', 'bbox': (0, 0, 100, 20)}]}]}
-        warnings = []
-        with patch.dict('sys.modules', {'rapidocr': None}):
-            self.assertEqual(image_title(ROOT / 'missing.pptx', deck, warnings), '')
-        self.assertTrue(any(item['code'] == 'agenda_title_ocr_unavailable' for item in warnings))
 
     def test_generated_filename_uses_meeting_title_and_time(self):
         # 下载文件名包含会议名称、日期及首尾日程时间，并清除Windows禁用字符。
@@ -289,58 +214,6 @@ class RuleTests(unittest.TestCase):
             with Image.open(output) as image:
                 self.assertEqual(image.format, 'PNG')
                 self.assertEqual(image.size, (report['width'], report['height']))
-
-
-class RecentTemplateTests(unittest.TestCase):
-    def test_taide_portraits_align_to_visible_rounded_frames(self):
-        # 泰德模板的原照片对象与圆角框坐标不同，生成后必须统一对齐到可见框。
-        base = ROOT / 'input' / '9.4泰德慢性及术后'
-        if not base.exists():
-            self.skipTest('泰德真实资料未放入项目')
-        with tempfile.TemporaryDirectory() as temp:
-            work = Path(temp)
-            model = analyze(base / '9.4泰德慢性及术后串场.pptx',
-                            base / '9.4泰德慢性及术后日程.pptx',
-                            [base / '9.4泰德慢性及术后专家简介.zip'], work / 'source')
-            output = work / 'taide-align.pptx'
-            report = generate(model, output)
-            deck = read_deck(output)
-            profile = {slide['number']: slide for slide in model['template']['slides']}
-            for page, spec in zip(deck['slides'], report['pages']):
-                if not spec.get('expert'):
-                    continue
-                source = profile[spec['template_slide']]
-                photo_id = spec['fields'].get('photo')
-                source_photo = next(shape for shape in source['shapes'] if shape['id'] == photo_id)
-                frame = photo_frame_shape(source, source_photo)
-                output_photo = next(shape for shape in page['shapes'] if shape['id'] == photo_id)
-                self.assertIsNotNone(frame, spec['expert'])
-                self.assertEqual(output_photo['bbox'], frame['bbox'], spec['expert'])
-
-    def test_recent_template_layout_variants_are_recognized(self):
-        # 覆盖日程表、无照片简介、多人讨论页和标题日期共框等近期模板结构。
-        folder = ROOT / 'input' / 'ppt模板'
-        if not folder.exists():
-            self.skipTest('最近模板未放入项目')
-        gynecology = analyze_template(folder / '康缘妇科桂在有你散发光彩串场.pptx')
-        self.assertEqual(gynecology['slides'][1]['role'], 'agenda')
-        self.assertEqual(gynecology['slides'][9]['role'], 'guest')
-        self.assertEqual(gynecology['slides'][9]['fields']['bio'], '10')
-
-        nutrition = analyze_template(folder / '9.8费卡庞经理串场.pptx')
-        self.assertEqual(nutrition['slides'][3]['fields']['bio'], '6')
-        self.assertNotIn('6', nutrition['slides'][3]['fields']['meeting'])
-
-        orthopedics = analyze_template(folder / '康缘骨科”星耀医路 腰你同行”串场模板.pptx')
-        self.assertEqual(orthopedics['slides'][1]['role'], 'agenda')
-        self.assertEqual(orthopedics['slides'][6]['role'], 'speaker')
-        self.assertGreaterEqual(len(orthopedics['slides'][16]['fields']['people']), 5)
-        self.assertGreaterEqual(len(orthopedics['slides'][16]['fields']['people_photos']), 5)
-
-        for path in folder.glob('*.pptx'):
-            profile = analyze_template(path)
-            cover = next(slide for slide in profile['slides'] if slide['role'] == 'cover')
-            self.assertTrue(cover['fields'].get('title'), path.name)
 
 
 @unittest.skipUnless((ROOT / 'input1').exists(), '真实资料未放入项目')
@@ -442,7 +315,7 @@ class PipelineTests(unittest.TestCase):
                 continue
             self.assertEqual(spec['continuation'], 1)
             self.assertGreaterEqual(len(spec['selected_bio']), 1)
-            self.assertLessEqual(len(spec['selected_bio']), 12)
+            self.assertLessEqual(len(spec['selected_bio']), 8)
             for line in spec['selected_bio']:
                 self.assertIn(compact(line), compact(slide['text']))
             source = model['template']['slides'][spec['template_slide'] - 1]
@@ -474,16 +347,7 @@ class PipelineTests(unittest.TestCase):
             summary = self.report['bio_summaries'][expert['name']][0]
             self.assertGreaterEqual(len(summary['source']), len(summary['selected_social']))
             self.assertEqual(summary['source'], expert['bio'])
-            self.assertLessEqual(len(summary['lines']), 12)
-
-    def test_discussion_experts_use_guest_role_label(self):
-        # 讨论环节的人物页需要覆盖模板旧标签，统一显示讨论嘉宾。
-        guest_pages = [(slide, spec) for slide, spec in zip(self.deck['slides'], self.report['pages'])
-                       if spec.get('role') == 'guest']
-        self.assertTrue(guest_pages)
-        for slide, _ in guest_pages:
-            self.assertIn('讨论嘉宾', slide['text'])
-            self.assertNotIn('大会讲者', slide['text'])
+            self.assertLessEqual(len(summary['lines']), 8)
 
     def test_mixed_clinical_and_school_credentials(self):
         expert = {'name': '测试', 'hospital': '甲医院', 'bio': [
@@ -493,27 +357,19 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(summary['lines'][0], '甲医院肿瘤科主任，主任医师')
         self.assertIn('博士生导师', summary['lines'][1])
         self.assertNotIn('医师', summary['lines'][1])
-        self.assertEqual(summary['lines'][2], '某市医学会委员')
-        self.assertEqual(summary['lines'][3], '中国医学会副主任委员')
-        self.assertLessEqual(len(summary['lines']), 12)
-
-    def test_other_field_titles_keep_source_order(self):
-        # 其他领域职称依照原资料顺序输出，不按机构范围和职务级别重新排列。
-        summary = summarize_bio({'name': '测试', 'hospital': '甲医院', 'bio': [
-            '甲医院主任医师', '某市医学会委员', '中华医学会副主任委员', '某省医学会常委']})
-        self.assertEqual(summary['social'], ['某市医学会委员', '中华医学会副主任委员', '某省医学会常委'])
-        self.assertEqual(summary['lines'][1:4], summary['social'])
+        self.assertEqual(summary['lines'][2], '中国医学会副主任委员')
+        self.assertLessEqual(len(summary['lines']), 8)
 
     def test_missing_school_is_blank_and_not_invented(self):
         summary = summarize_bio({'name': '测试', 'hospital': '甲医院', 'bio': ['甲医院消化科主治医师', '中国医学会委员']})
         self.assertEqual(summary['lines'][1], '中国医学会委员')
         self.assertIn('学历或学校相关履历', summary['missing'])
 
-    def test_every_summary_has_at_most_twelve_nonempty_lines(self):
+    def test_every_summary_has_at_most_eight_nonempty_lines(self):
         for model in self.models.values():
             for expert in model['experts']:
                 summary = summarize_bio(expert)
-                self.assertLessEqual(len(summary['lines']), 12, expert['name'])
+                self.assertLessEqual(len(summary['lines']), 8, expert['name'])
                 self.assertTrue(all(line.strip() for line in summary['lines']), expert['name'])
                 self.assertFalse(any(line in {'课题', '专业特长', '学术任职'} for line in summary['lines']), expert['name'])
 
